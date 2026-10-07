@@ -30,6 +30,17 @@ with tempfile.TemporaryDirectory(prefix='pi-tweaks-pty-') as directory:
     workspace = root / 'workspace'
     agent.mkdir()
     workspace.mkdir()
+    (agent / 'extensions').mkdir()
+    (agent / 'extensions' / 'demo-renderers.ts').write_text('''
+import { Text } from "@earendil-works/pi-tui";
+export default function (pi) {
+  pi.registerToolRenderer((name, next) => name.startsWith("demo_compact_") ? {
+    renderShell: "default",
+    renderCall: () => new Text(name === "demo_compact_a" ? "COMPACT_CALL_A" : "COMPACT_CALL_B", 0, 0),
+    renderResult: () => ({ render: () => [], invalidate() {} }),
+  } : next());
+}
+''')
     (agent / 'settings.json').write_text(json.dumps({
         'theme': 'dark', 'tuiMode': 'fullscreen',
         'quietStartup': True, 'hideThinkingBlock': True,
@@ -54,6 +65,13 @@ with tempfile.TemporaryDirectory(prefix='pi-tweaks-pty-') as directory:
                 'stopReason': stop, 'timestamp': now}
 
     append_message({'role': 'user', 'content': 'Hover smoke test', 'timestamp': now})
+    append_message(assistant([
+        {'type': 'toolCall', 'id': 'compact-a', 'name': 'demo_compact_a', 'arguments': {}},
+        {'type': 'toolCall', 'id': 'compact-b', 'name': 'demo_compact_b', 'arguments': {}},
+    ], 'toolUse'))
+    for name, call in [('demo_compact_a', 'compact-a'), ('demo_compact_b', 'compact-b')]:
+        append_message({'role': 'toolResult', 'toolCallId': call, 'toolName': name,
+                        'content': [], 'isError': False, 'timestamp': now})
     append_message(assistant([
         {'type': 'thinking', 'thinking': 'PTY_THOUGHT_DETAIL'},
         {'type': 'text', 'text': 'HOVER_SMOKE_REPLY\n\nsecond reply line'},
@@ -158,6 +176,8 @@ with tempfile.TemporaryDirectory(prefix='pi-tweaks-pty-') as directory:
         wait_for(lambda: b'Usage: /question-nav <number>. 2 questions are rendered.' in received,
                  'the package entrypoint did not register the navigation command')
         assert not any(line.startswith(('┌', '│', '└')) for line in screen().values())
+        assert row_with('COMPACT_CALL_B') - row_with('COMPACT_CALL_A') == 2, 'tool calls must have only one blank separating row'
+        print('PASS: real CLI tool shells have compact one-row spacing.')
         for marker in ['HOVER_SMOKE_REPLY', 'TOOL_CALL_MARKER', 'TOOL_RESULT_MARKER',
                        'PTY_BASH_MARKER', 'PTY_CUSTOM_MARKER', 'Usage: /question-nav', 'PTY_FINAL_REPLY']:
             hover(marker)
@@ -222,6 +242,18 @@ with tempfile.TemporaryDirectory(prefix='pi-tweaks-pty-') as directory:
         wait_for(lambda: row_with('SECOND_USER_MARKER') is not None,
                  'numbered keyboard navigation did not locate the second question')
         assert session.read_bytes() == before_jump, 'keyboard navigation changed the session'
+        send('/question-nav 1\r')
+        wait_for(lambda: row_with('Hover smoke test') is not None and row_with('Hover smoke test') <= 3, 'first question not located')
+        wait_for(lambda: row_with('↓') is not None, 'minimal jump-to-end arrow did not appear')
+        assert row_with('Jump to latest message') is None, 'verbose jump banner remains visible'
+        arrow_row = row_with('↓')
+        arrow_column = screen()[arrow_row].index('↓') + 1
+        mouse(0, arrow_column, arrow_row)
+        mouse(0, arrow_column, arrow_row, 'm')
+        wait_for(lambda: row_with('PTY_FINAL_REPLY') is not None and row_with('↓') is None,
+                 'arrow click did not restore follow-end scrolling')
+        assert session.read_bytes() == before_jump
+        print('PASS: compact arrow replaces the verbose banner and still jumps to the latest message.')
         assert not (agent / 'pi-tweaks.json').exists()
         assert not (agent / 'ai-hover-frame.json').exists()
         print('PASS: numbered keyboard navigation works without switch commands or preference files.')

@@ -1,7 +1,8 @@
 /**
- * pi-tweaks: message hover brackets and a question timeline. Tested with Pi 1.0.4.
+ * pi-tweaks: compact tool calls, hover brackets, question navigation and a minimal jump arrow.
+ * Tested with Pi 1.0.4.
  *
- * Loading the extension enables both features. There are no per-feature switches
+ * Loading the extension enables all tweaks. There are no per-feature switches
  * or preference files; manage the extension through Pi's resource configuration.
  * /question-nav <number> provides keyboard-only viewport navigation.
  *
@@ -20,6 +21,7 @@ import { contains, transcriptContainer, flowChildren, chatEntryBox, questionSnap
 	computeQuestionRail, railContains, railGutterContains, railHit, paintQuestionNavigation, NAV_GUTTER_WIDTH,
 	type LayoutBox, type LayoutFrame, type Pointer, type ChatScrollView, type ScrollbarMode,
 	type QuestionRail } from "./lib/question-navigation.ts";
+import { createToolCompactor } from "./lib/compact-tools.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
@@ -43,6 +45,9 @@ interface HoverTUI extends TUI {
 	hasActiveSelection(): boolean;
 	handleViewportInput(data: string): unknown;
 	compositeScrollToEndIndicator(screen: string[], layout: LayoutFrame, width: number): string[];
+	doRender(): void;
+	layoutRoot?: Component;
+	scrollToEndIndicator?: () => string;
 	selectionPressActive?: boolean;
 	mouseCapture?: unknown;
 	mousePressTarget?: unknown;
@@ -76,7 +81,8 @@ function hoveredChatEntry(box: LayoutBox, pointer: Pointer, chat: Component): La
 export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTweaksOptions = {}): PiTweaksController {
 	const reference = tui as HoverTUI;
 	if (reference.mode !== "fullscreen" || typeof reference.handleViewportInput !== "function" ||
-		typeof reference.compositeScrollToEndIndicator !== "function" || typeof reference.hasActiveSelection !== "function") {
+		typeof reference.compositeScrollToEndIndicator !== "function" || typeof reference.hasActiveSelection !== "function" ||
+		typeof reference.doRender !== "function") {
 		throw new Error("pi-tweaks needs Pi's compatible fullscreen TUI (tested with 1.0.4).");
 	}
 	// Widget factories receive a stable TUI Proxy. defineProperty on that Proxy
@@ -97,8 +103,13 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 
 	const inputDescriptor = Object.getOwnPropertyDescriptor(ui, "handleViewportInput");
 	const paintDescriptor = Object.getOwnPropertyDescriptor(ui, "compositeScrollToEndIndicator");
+	const renderDescriptor = Object.getOwnPropertyDescriptor(ui, "doRender");
+	const indicatorDescriptor = Object.getOwnPropertyDescriptor(ui, "scrollToEndIndicator");
 	const originalInput = ui.handleViewportInput;
 	const originalPaint = ui.compositeScrollToEndIndicator;
+	const originalRender = ui.doRender;
+	const originalIndicator = ui.scrollToEndIndicator;
+	const tools = createToolCompactor();
 	let pointer: Pointer | undefined;
 	let disposed = false;
 	let lastRail: QuestionRail | undefined;
@@ -282,6 +293,15 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 			ui.hasOverlay() || nativeGesture() ? undefined : pointer, !ui.hasActiveSelection()) : result;
 	};
 
+	const patchedRender = function (this: HoverTUI): void {
+		if (!disposed) tools.prepare(this.layoutRoot ?? this.currentLayout?.root.component);
+		originalRender.call(this);
+	};
+	const minimalIndicator = () => disposed ? originalIndicator?.() ?? "" : getTheme().fg("muted", " ↓ ");
+	if (typeof originalIndicator === "function") {
+		Object.defineProperty(ui, "scrollToEndIndicator", { configurable: true, writable: true, value: minimalIndicator });
+	}
+	Object.defineProperty(ui, "doRender", { configurable: true, writable: true, value: patchedRender });
 	Object.defineProperty(ui, "handleViewportInput", { configurable: true, writable: true, value: patchedInput });
 	Object.defineProperty(ui, "compositeScrollToEndIndicator", { configurable: true, writable: true, value: patchedPaint });
 	// Pi normally omits all-motion tracking in multiplexers; opt in only while this extension is active.
@@ -293,7 +313,16 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		pointer = undefined;
 		navPress = undefined;
 		lastRail = undefined;
+		tools.restore();
 		restoreScrollbars();
+		if (ui.doRender === patchedRender) {
+			if (renderDescriptor) Object.defineProperty(ui, "doRender", renderDescriptor);
+			else delete (ui as Partial<HoverTUI>).doRender;
+		}
+		if (ui.scrollToEndIndicator === minimalIndicator) {
+			if (indicatorDescriptor) Object.defineProperty(ui, "scrollToEndIndicator", indicatorDescriptor);
+			else delete (ui as Partial<HoverTUI>).scrollToEndIndicator;
+		}
 		if (ui.handleViewportInput === patchedInput) {
 			if (inputDescriptor) Object.defineProperty(ui, "handleViewportInput", inputDescriptor);
 			else delete (ui as Partial<HoverTUI>).handleViewportInput;

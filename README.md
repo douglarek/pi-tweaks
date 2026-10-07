@@ -23,6 +23,14 @@ pi remove git:github.com/douglarek/pi-tweaks
 
 ## What we tweak
 
+### Compact tool calls
+
+Native tool shells drop their extra top/bottom padding while keeping a single blank row between calls. Tool output content and tool-owned self renderers are left intact; expanding results, selecting text, and clicking tools keep their native behavior.
+
+### Minimal jump-to-latest indicator
+
+When browsing earlier messages, the verbose jump-to-latest banner becomes a small clickable `↓`. Clicking it or pressing `Ctrl+End` still returns to the latest message and resumes follow-end scrolling.
+
 ### Message hover brackets
 
 Hover over any chat message to reveal a subtle left-side bracket spanning the entry. User messages, assistant text, thinking, tool calls/results, command output, custom entries, summaries, warnings, and status notices are all covered.
@@ -155,7 +163,7 @@ To use it, save the following JSON as `~/.pi/agent/themes/grok-transparent.json`
 
 - Fullscreen mode; tested with Pi **1.0.4**.
 - The rail appears with at least two rendered questions and enough terminal space. Skill headers and their accompanying question count as one user turn.
-- Both tweaks are active whenever the extension is loaded; no separate switches or preference files.
+- All tweaks are active whenever the extension is loaded; no separate switches or preference files.
 - Runtime hooks and temporary gutter sizing are scoped to active instances and restored on unload/reload. Pi's installed source files are not modified. Private TUI hooks may require adaptation after Pi upgrades.
 
 Screenshots are captured from the actual Pi CLI in an isolated Kitty window using a synthetic demo conversation. They contain no private chat or real model requests.

@@ -41,7 +41,7 @@ const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageC
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
 const { getThemeByName } = await import(`${pkg}/dist/modes/interactive/theme/theme.js`);
 const { createInteractiveTuiReference } = await import(`${pkg}/dist/modes/interactive/tui-renderer.js`);
-const { Container, ScrollView, Text, TuiAltScreen, VStack, sliceByColumn, stripTerminalSequences, visibleWidth } =
+const { Box, Container, ScrollView, Text, TuiAltScreen, VStack, sliceByColumn, stripTerminalSequences, visibleWidth } =
 	await import(pathToFileURL(require.resolve("@earendil-works/pi-tui")).href);
 initTheme("dark");
 const theme = getThemeByName("dark");
@@ -88,7 +88,7 @@ function boxOf(box, component) {
 	}
 }
 function fixture({ text = "第一块 AI 消息。\n\nSecond line with **Markdown** and a [link](https://example.com).",
-	thinking, padding = 1, rows = 22, columns = 60, two = false } = {}) {
+	thinking, padding = 1, rows = 22, columns = 60, two = false, indicator } = {}) {
 	const terminal = new Terminal();
 	terminal.rows = rows;
 	terminal.columns = columns;
@@ -122,7 +122,7 @@ function fixture({ text = "第一块 AI 消息。\n\nSecond line with **Markdown
 		{ component: editor, basis: 1, shrink: 0 },
 	]);
 	const copies = [];
-	const tui = new TuiAltScreen(terminal, false, undefined, { copyOnSelect: false,
+	const tui = new TuiAltScreen(terminal, false, undefined, { copyOnSelect: false, scrollToEndIndicator: indicator,
 		copySelection: async (text) => { copies.push(text); return true; } });
 	tui.setLayoutRoot(root);
 	tui.setFocus(editor);
@@ -246,7 +246,7 @@ test("pi-tweaks regression suite", async (t) => {
 		const unpatch = installAiHoverFrame(f.tui, () => theme);
 		try {
 			assert.equal(hasBracket(f.hover(tool)), true);
-			const headerRow = f.box(tool).rect.y + 2;
+			const headerRow = f.box(tool).rect.y + 1;
 			f.emit(0, 5, headerRow);
 			f.emit(0, 5, headerRow, "m");
 			assert.equal(tool.expanded, true);
@@ -285,6 +285,73 @@ test("pi-tweaks regression suite", async (t) => {
 			assert.equal(f.copies.length, 1);
 			assert.match(f.copies[0], /第一块 AI 消息/);
 			assert.doesNotMatch(f.copies[0], /[┌│└]/u);
+		} finally { unpatch(); f.tui.stop(); }
+	});
+
+	await t.test("native tool shells use one blank row; late tools compact and original padding restores", () => {
+		const f = fixture({ rows: 50 });
+		const definition = (label) => ({ renderCall: () => new Text(label, 0, 0), renderResult: () => ({ render: () => [], invalidate() {} }) });
+		const first = new ToolExecutionComponent("read", "compact-a", {}, { showImages: false }, definition("COMPACT_CALL_A"), f.tui, process.cwd());
+		const second = new ToolExecutionComponent("read", "compact-b", {}, { showImages: false }, definition("COMPACT_CALL_B"), f.tui, process.cwd());
+		first.updateResult({ content: [], isError: false });
+		second.updateResult({ content: [], isError: false });
+		f.document.addChild(first); f.document.addChild(second);
+		const before = f.render();
+		assert.equal(before.findIndex((line) => line.includes("COMPACT_CALL_B")) - before.findIndex((line) => line.includes("COMPACT_CALL_A")), 4);
+		const ownedShell = new Box(1, 2);
+		ownedShell.addChild(new Text("SELF_RENDERED_CONTENT", 0, 0));
+		const self = new ToolExecutionComponent("self", "compact-self", {}, { showImages: false },
+			{ renderShell: "self", renderCall: () => ownedShell }, f.tui, process.cwd());
+		f.document.addChild(self); f.render();
+		const selfBefore = self.render(60);
+		const originalRender = f.tui.doRender;
+		const unpatch = installAiHoverFrame(f.tui, () => theme);
+		try {
+			const compact = f.render();
+			assert.equal(compact.findIndex((line) => line.includes("COMPACT_CALL_B")) - compact.findIndex((line) => line.includes("COMPACT_CALL_A")), 2);
+			assert.equal(first.contentBox.paddingY, 0);
+			assert.equal(first.contentText.paddingY, 0);
+			assert.equal(ownedShell.paddingY, 2, "tool-owned self-rendered content must not be altered");
+			assert.deepEqual(self.render(60), selfBefore);
+			const title = compact.findIndex((line) => line.includes("COMPACT_CALL_A"));
+			f.emit(0, 5, title); f.emit(0, 5, title, "m"); f.render();
+			assert.equal(first.expanded, true, "mouse geometry must match compact rendering");
+			const late = new ToolExecutionComponent("late-mcp", "late", {}, { showImages: false }, undefined, f.tui, process.cwd());
+			f.document.addChild(late); f.render();
+			assert.equal(late.contentText.paddingY, 0);
+			f.document.removeChild(late); f.render();
+			assert.equal(late.contentText.paddingY, 1, "detached tools must release their padding lease");
+			unpatch(); f.render();
+			assert.equal(first.contentBox.paddingY, 1);
+			assert.equal(first.contentText.paddingY, 1);
+			assert.equal(f.tui.doRender, originalRender);
+		} finally { unpatch(); f.tui.stop(); }
+	});
+
+	await t.test("the native latest-message hint becomes a clickable arrow and keeps Ctrl+End", () => {
+		const originalIndicator = () => " ↓ Jump to latest message · Ctrl+End ";
+		const f = fixture({ rows: 14, columns: 70, indicator: originalIndicator,
+			text: Array.from({ length: 35 }, (_, index) => `MESSAGE_LINE_${index}`).join("\n") });
+		const unpatch = installAiHoverFrame(f.tui, () => theme);
+		try {
+			f.scroll.scrollToStart();
+			const lines = f.render();
+			assert.ok(lines.some((line) => line.includes("↓")));
+			assert.ok(lines.every((line) => !line.includes("Jump to latest") && !line.includes("Ctrl+End")));
+			const rect = f.tui.scrollToEndIndicatorRect;
+			assert.equal(rect.width, 3);
+			f.emit(0, rect.column + 1, rect.row);
+			f.emit(0, rect.column + 1, rect.row, "m");
+			f.render();
+			assert.equal(f.scroll.isFollowingEnd, true);
+			assert.equal(f.tui.scrollToEndIndicatorRect, undefined);
+			f.scroll.scrollToStart(); f.render();
+			f.terminal.input("\x1b[1;5F"); f.render();
+			assert.equal(f.scroll.isFollowingEnd, true);
+			unpatch();
+			assert.equal(f.tui.scrollToEndIndicator, originalIndicator);
+			f.scroll.scrollToStart();
+			assert.ok(f.render().some((line) => line.includes("Jump to latest message")));
 		} finally { unpatch(); f.tui.stop(); }
 	});
 
