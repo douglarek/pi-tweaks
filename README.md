@@ -31,6 +31,8 @@ Native tool shells drop their extra top/bottom padding while keeping a single bl
 
 When browsing earlier messages, the verbose jump-to-latest banner becomes a small clickable `↓`. Clicking it or pressing `Ctrl+End` still returns to the latest message and resumes follow-end scrolling.
 
+![A compact down arrow above the editor while reviewing earlier messages, with an unsent draft preserved.](docs/images/jump-to-latest.png)
+
 ### Message hover brackets
 
 Hover over any chat message to reveal a subtle left-side bracket spanning the entry. User messages, assistant text, thinking, tool calls/results, command output, custom entries, summaries, warnings, and status notices are all covered.
