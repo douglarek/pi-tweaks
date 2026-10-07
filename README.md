@@ -2,6 +2,25 @@
 
 Small fullscreen UI tweaks for Pi.
 
+## Install
+
+With Pi already installed, run:
+
+```bash
+pi install git:github.com/douglarek/pi-tweaks
+```
+
+Start Pi normally, or run `/reload` in an existing session. The extension activates automatically in **fullscreen** mode; no extra plugin configuration is needed.
+
+If you previously copied `pi-tweaks` into `~/.pi/agent/extensions/`, remove that manual copy before using the Git package to avoid loading the extension twice.
+
+To update or uninstall:
+
+```bash
+pi update git:github.com/douglarek/pi-tweaks
+pi remove git:github.com/douglarek/pi-tweaks
+```
+
 ## What we tweak
 
 ### Message hover brackets
