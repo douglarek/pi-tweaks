@@ -60,7 +60,7 @@ export function contains(rect: Rect, point: Pointer): boolean {
 		point.y >= rect.y && point.y < rect.y + rect.height;
 }
 export function transcriptContainer(layout: LayoutFrame): Component | undefined {
-	// Native Pi 1.0.4 primary document: [header, loaded resources, chat].
+	// Native Pi 1.0.4 – 1.1.0 primary document: [header, loaded resources, chat].
 	const document = layout.primaryScrollView?.child as Container | undefined;
 	const children = document?.children;
 	if (!Array.isArray(children) || children.length !== 3 ||

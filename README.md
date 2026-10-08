@@ -163,7 +163,7 @@ To use it, save the following JSON as `~/.pi/agent/themes/grok-transparent.json`
 
 ## Current scope
 
-- Fullscreen mode; tested with Pi **1.0.4**.
+- Fullscreen mode; tested with Pi **1.0.4 – 1.1.0**.
 - The rail appears with at least two rendered questions and enough terminal space. Skill headers and their accompanying question count as one user turn.
 - All tweaks are active whenever the extension is loaded; no separate switches or preference files.
 - Runtime hooks and temporary gutter sizing are scoped to active instances and restored on unload/reload. Pi's installed source files are not modified. Private TUI hooks may require adaptation after Pi upgrades.

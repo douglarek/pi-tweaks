@@ -1,6 +1,6 @@
 /**
  * pi-tweaks: compact tool calls, hover brackets, question navigation and a minimal jump arrow.
- * Tested with Pi 1.0.4.
+ * Tested with Pi 1.0.4 – 1.1.0.
  *
  * Loading the extension enables all tweaks. There are no per-feature switches
  * or preference files; manage the extension through Pi's resource configuration.
@@ -83,7 +83,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 	if (reference.mode !== "fullscreen" || typeof reference.handleViewportInput !== "function" ||
 		typeof reference.compositeScrollToEndIndicator !== "function" || typeof reference.hasActiveSelection !== "function" ||
 		typeof reference.doRender !== "function") {
-		throw new Error("pi-tweaks needs Pi's compatible fullscreen TUI (tested with 1.0.4).");
+		throw new Error("pi-tweaks needs Pi's compatible fullscreen TUI (tested with 1.0.4 – 1.1.0).");
 	}
 	// Widget factories receive a stable TUI Proxy. defineProperty on that Proxy
 	// does NOT reach its renderer, whereas method calls are bound to the renderer.
