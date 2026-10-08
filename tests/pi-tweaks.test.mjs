@@ -40,6 +40,8 @@ const { PromptSuggestionState, sanitizeSuggestion, buildTranscript } =
 	await jiti.import(fileURLToPath(new URL("../lib/prompt-suggestion.ts", import.meta.url)));
 const { installQueueDispatch, dispatchEarliestQueuedMessage, collectQueuedMessages, resolveSession, resolveEditor } =
 	await jiti.import(fileURLToPath(new URL("../lib/queue-dispatch.ts", import.meta.url)));
+const { shortenPath, renderCompactFooter, installCompactFooter, resolveFooter, formatTokens, formatCwdForFooter } =
+	await jiti.import(fileURLToPath(new URL("../lib/compact-footer.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
@@ -983,6 +985,178 @@ test("pi-tweaks regression suite", async (t) => {
 
 		controller();
 		assert.equal(editor.onSubmit, originalSubmit, "disposing should restore original onSubmit");
+		tui.stop();
+	});
+
+	await t.test("compact footer: unified single-line status bar with directory, stats and model", () => {
+		const cwd = join(process.env.HOME || "/home/user", "work/default");
+		const mockSession = {
+			sessionManager: {
+				getCwd: () => cwd,
+				getSessionName: () => undefined,
+				getEntries: () => [],
+				getEntryCount: () => 0,
+				getSessionId: () => "sess-1",
+				getLeafId: () => null,
+			},
+			state: {
+				model: { id: "gemini-3.8-flash-high", reasoning: true, contextWindow: 1048576, provider: "cpa" },
+				thinkingLevel: "high",
+			},
+			autoCompactionEnabled: true,
+			getContextUsage: () => ({ tokens: 3000, contextWindow: 1048576, percent: 0.3 }),
+		};
+		const mockFooterData = {
+			getGitBranch: () => "master",
+			getExtensionStatuses: () => new Map(),
+			getAvailableProviderCount: () => 1,
+			onBranchChange: () => () => {},
+		};
+		const mockFooter = {
+			session: mockSession,
+			footerData: mockFooterData,
+			autoCompactEnabled: true,
+			getSessionStats: () => ({
+				usageTotals: { input: 6500, output: 180, cacheRead: 0, cacheWrite: 0, cost: 0.012 },
+				contextUsage: { tokens: 3000, contextWindow: 1048576, percent: 0.3 },
+			}),
+			render: () => ["line1", "line2"],
+		};
+
+		// In wide terminal (120 cols): single line containing directory, branch, stats, auto, model, thinking
+		const lines = renderCompactFooter(mockFooter, theme, 120);
+		assert.equal(lines.length, 1, "compact footer must be a single line");
+		const text = stripTerminalSequences(lines[0]);
+		assert.ok(text.includes("~/work/default"), "should contain directory path");
+		assert.ok(text.includes("(master)"), "should contain git branch");
+		assert.ok(text.includes("↑6.5k"), "should contain input tokens");
+		assert.ok(text.includes("↓180"), "should contain output tokens");
+		assert.ok(text.includes("0.3%/1.0M (auto)"), "should contain context percentage and auto indicator");
+		assert.ok(text.includes("gemini-3.8-flash-high • high"), "should contain model and thinking level");
+	});
+
+	await t.test("compact footer: path shortening preserves git branch and hover displays full path", () => {
+		const longCwd = join(process.env.HOME || "/home/user", "work/projects/company/my-microservice/pkg/deep/sub");
+		const mockSession = {
+			sessionManager: {
+				getCwd: () => longCwd,
+				getSessionName: () => undefined,
+				getEntries: () => [],
+				getEntryCount: () => 0,
+				getSessionId: () => "sess-2",
+				getLeafId: () => null,
+			},
+			state: {
+				model: { id: "gemini-3.8-flash-high", reasoning: true, contextWindow: 1048576, provider: "cpa" },
+				thinkingLevel: "high",
+			},
+			autoCompactionEnabled: true,
+			getContextUsage: () => ({ tokens: 3000, contextWindow: 1048576, percent: 0.3 }),
+		};
+		const mockFooterData = {
+			getGitBranch: () => "feature/branch-xyz",
+			getExtensionStatuses: () => new Map(),
+			getAvailableProviderCount: () => 1,
+			onBranchChange: () => () => {},
+		};
+		const mockFooter = {
+			session: mockSession,
+			footerData: mockFooterData,
+			autoCompactEnabled: true,
+			isHovered: false,
+			getSessionStats: () => ({
+				usageTotals: { input: 6500, output: 180, cacheRead: 0, cacheWrite: 0, cost: 0 },
+				contextUsage: { tokens: 3000, contextWindow: 1048576, percent: 0.3 },
+			}),
+			render: () => ["line1", "line2"],
+		};
+
+		// 1. In a 75-column terminal, the long path must be shortened with middle ellipsis
+		const normalLines = renderCompactFooter(mockFooter, theme, 75);
+		assert.equal(normalLines.length, 1);
+		const normalText = stripTerminalSequences(normalLines[0]);
+		assert.ok(normalText.includes("(feature/branch-xyz)"), "branch must remain complete when path is shortened");
+		assert.ok(!normalText.includes("my-microservice/pkg/deep/sub"), "path should be shortened");
+		assert.ok(normalText.includes("..."), "path should contain ellipsis");
+
+		// 2. When hovered, full path is displayed
+		mockFooter.isHovered = true;
+		const hoveredLines = renderCompactFooter(mockFooter, theme, 75);
+		assert.equal(hoveredLines.length, 1);
+		const hoveredText = stripTerminalSequences(hoveredLines[0]);
+		assert.ok(hoveredText.includes("my-microservice"), "hovered footer must display full path");
+		assert.ok(hoveredText.includes("(feature/branch-xyz)"), "branch must remain intact when hovered");
+	});
+
+	await t.test("compact footer: installCompactFooter hooks footer, tracks mouse hover and unhooks on dispose", () => {
+		const term = new Terminal();
+		term.columns = 80;
+		term.rows = 20;
+
+		const cwd = join(process.env.HOME || "/home/user", "work/default");
+		const mockSession = {
+			sessionManager: {
+				getCwd: () => cwd,
+				getSessionName: () => undefined,
+				getEntries: () => [],
+				getEntryCount: () => 0,
+				getSessionId: () => "sess-3",
+				getLeafId: () => null,
+			},
+			state: {
+				model: { id: "gpt-4o", reasoning: false },
+				thinkingLevel: "off",
+			},
+			autoCompactionEnabled: true,
+			getContextUsage: () => ({ tokens: 500, contextWindow: 128000, percent: 0.4 }),
+		};
+		const mockFooterData = {
+			getGitBranch: () => "main",
+			getExtensionStatuses: () => new Map(),
+			getAvailableProviderCount: () => 1,
+			onBranchChange: () => () => {},
+		};
+		const originalRender = () => ["Line 1: /work", "Line 2: stats"];
+		const mockFooter = {
+			session: mockSession,
+			footerData: mockFooterData,
+			autoCompactEnabled: true,
+			getSessionStats: () => ({
+				usageTotals: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0 },
+				contextUsage: { tokens: 500, contextWindow: 128000, percent: 0.4 },
+			}),
+			render: originalRender,
+		};
+
+		const root = new VStack([
+			{ component: new ScrollView(new Text("content", 0, 0)), grow: 1 },
+			{ component: mockFooter, basis: 1, shrink: 0 },
+		]);
+		const tui = new TuiAltScreen(term, false, undefined, {});
+		tui.setLayoutRoot(root);
+		tui.start();
+
+		const controller = installCompactFooter(tui, () => theme);
+		assert.notEqual(mockFooter.render, originalRender, "footer.render should be hooked");
+
+		// Initial render is compact single line
+		const lines = mockFooter.render(80);
+		assert.equal(lines.length, 1);
+		assert.equal(controller.isHovered(), false);
+
+		// Mouse over the path area on the footer line (row 19)
+		const changedIn = controller.checkPointer({ x: 5, y: 19 }, 20);
+		assert.equal(changedIn, true, "entering footer path should change hover state");
+		assert.equal(controller.isHovered(), true);
+
+		// Mouse moves off to row 5 (transcript)
+		const changedOut = controller.checkPointer({ x: 5, y: 5 }, 20);
+		assert.equal(changedOut, true, "leaving footer path should revert hover state");
+		assert.equal(controller.isHovered(), false);
+
+		// Dispose restores original render
+		controller.dispose();
+		assert.equal(mockFooter.render, originalRender, "dispose should restore original render");
 		tui.stop();
 	});
 

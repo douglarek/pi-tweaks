@@ -199,6 +199,12 @@ export default function (pi) {
         hover('TOOL_RESULT_MARKER')
         print('PASS: unload/reload restores and reattaches the renderer hooks.')
 
+        # Compact footer: directory path, auto compact indicator and model are unified onto a single line.
+        footer_line = next((line for line in screen().values() if 'workspace' in line), None)
+        assert footer_line is not None and '(auto)' in footer_line and ('gpt-4o' in footer_line or 'unknown' in footer_line), \
+            'workspace, auto indicator and model must be on the same footer line: ' + str(footer_line)
+        print('PASS: compact status bar shows directory, stats and model on a single line.')
+
         # Empty enter with empty queue remains safe and non-crashing in real CLI.
         send('\r')
         collect(.3)

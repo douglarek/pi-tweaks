@@ -25,6 +25,7 @@ import { createToolCompactor } from "./lib/compact-tools.ts";
 import { PromptSuggestionState, paintPromptSuggestion, handlePromptSuggestionInput,
 	buildTranscript, sanitizeSuggestion } from "./lib/prompt-suggestion.ts";
 import { installQueueDispatch, type QueueDispatchController, type SessionLike } from "./lib/queue-dispatch.ts";
+import { installCompactFooter, type CompactFooterController } from "./lib/compact-footer.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
@@ -32,6 +33,7 @@ interface PiTweaksOptions {
 	questionNav?: () => boolean;
 	promptSuggestions?: () => boolean;
 	queueDispatch?: () => boolean;
+	footer?: () => boolean;
 	session?: () => SessionLike | undefined;
 }
 export interface PiTweaksController {
@@ -42,6 +44,8 @@ export interface PiTweaksController {
 	getSuggestion?(): string | null;
 	clearSuggestion?(): void;
 	dispatchQueuedMessage?(): Promise<boolean>;
+	isFooterHovered?(): boolean;
+	setFooterHovered?(hovered: boolean): boolean;
 }
 interface NavigationLease {
 	active: boolean;
@@ -133,6 +137,11 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		enabled: queueDispatchEnabled,
 		onRequestRender: () => ui.requestRender(),
 	});
+	const footerEnabled = () => options.footer?.() ?? true;
+	const footerController = installCompactFooter(ui, getTheme, {
+		enabled: footerEnabled,
+	});
+	footerController.checkFooter(ui.layoutRoot ?? ui.currentLayout?.root.component);
 	const framesEnabled = () => options.frames?.() ?? true;
 	const navEnabled = () => options.questionNav?.() ?? true;
 	const suggestionsEnabled = () => options.promptSuggestions?.() ?? true;
@@ -216,6 +225,10 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		const previous = getBox()?.component;
 		const previousSelected = selectedQuestion;
 		const previousHit = navHoverKey();
+		const previousFooterHover = footerController.isHovered();
+		if (data === "\x1b[O") {
+			if (footerController.setHovered(false)) ui.requestRender();
+		}
 		const mouse = MOUSE_MOVE.exec(data);
 		if (!mouse && suggestionsEnabled() && !ui.hasOverlay()) {
 			const outcome = handlePromptSuggestionInput(data, ui.currentLayout, suggestionState, () => ui.requestRender());
@@ -274,11 +287,15 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 			}
 		}
 		pointer = movement ? point : undefined;
+		if (footerEnabled()) {
+			footerController.checkPointer(movement ? point : undefined, ui.terminal.rows, ui.currentLayout);
+		}
 		const scroll = ui.currentLayout?.primaryScrollView;
 		const oldTop = scroll?.scrollTop;
 		const result = originalInput.call(this, data);
 		if (oldTop !== scroll?.scrollTop || (button & 64) !== 0) selectedQuestion = undefined;
-		if (previous !== getBox()?.component || previousHit !== navHoverKey() || previousSelected !== selectedQuestion) ui.requestRender();
+		if (previous !== getBox()?.component || previousHit !== navHoverKey() || previousSelected !== selectedQuestion ||
+			previousFooterHover !== footerController.isHovered()) ui.requestRender();
 		return result;
 	};
 
@@ -323,6 +340,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		if (!disposed) {
 			tools.prepare(this.layoutRoot ?? this.currentLayout?.root.component);
 			queueController.checkEditor();
+			footerController.checkFooter(this.layoutRoot ?? this.currentLayout?.root.component);
 		}
 		originalRender.call(this);
 	};
@@ -340,6 +358,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		if (disposed) return;
 		disposed = true;
 		queueController.dispose();
+		footerController.dispose();
 		pointer = undefined;
 		navPress = undefined;
 		lastRail = undefined;
@@ -386,6 +405,12 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 			}
 		},
 		dispatchQueuedMessage: () => queueController.dispatchNow(),
+		isFooterHovered: () => footerController.isHovered(),
+		setFooterHovered: (hovered: boolean) => {
+			const changed = footerController.setHovered(hovered);
+			if (changed) ui.requestRender();
+			return changed;
+		},
 	});
 }
 

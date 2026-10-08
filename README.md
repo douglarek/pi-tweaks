@@ -73,6 +73,13 @@ When a turn finishes and the editor is idle, the extension asks the model to pre
 
 When messages are queued while the agent is executing, pressing `Enter` in an empty editor immediately dispatches the earliest queued message. If a response is running, it is cancelled and the earliest message starts executing; any remaining queued messages stay in order in the follow-up queue.
 
+### Compact single-line status bar
+
+Pi's default multi-line status bar is consolidated into a single clean line:
+- Working directory, Git branch, token counts, cost, and context usage `(auto)` are displayed alongside the model and thinking level.
+- Long paths are automatically shortened with middle ellipsis while keeping the Git branch completely intact.
+- Hovering the mouse over the path immediately expands it to show the full directory path (with terminal OSC 8 hyperlink support).
+
 ### Native interactions stay native
 
 Text selection/copy, links, thinking expansion, tool expansion, keyboard focus, and overlays remain on Pi's normal input path. Brackets and previews are screen decorations, not transcript text.

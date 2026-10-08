@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Fullscreen Pi UI tweaks: message hover brackets and question timeline navigation.",
+  "description": "Fullscreen Pi UI tweaks: compact single-line status bar, message hover brackets, question navigation, prompt suggestions, and queue dispatch.",
   "keywords": ["pi-package"],
   "pi": {
     "extensions": ["./index.ts"]
