@@ -199,6 +199,11 @@ export default function (pi) {
         hover('TOOL_RESULT_MARKER')
         print('PASS: unload/reload restores and reattaches the renderer hooks.')
 
+        # Empty enter with empty queue remains safe and non-crashing in real CLI.
+        send('\r')
+        collect(.3)
+        assert process.poll() is None, 'empty enter caused process to crash'
+
         # Make the first question genuinely off-screen, then exercise the actual rail.
         ROWS = 24
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLUMNS, 0, 0))

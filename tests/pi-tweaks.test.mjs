@@ -38,6 +38,8 @@ const { questionSnapshot, computeQuestionRail, railHit, railContains, railGutter
 	await jiti.import(fileURLToPath(new URL("../lib/question-navigation.ts", import.meta.url)));
 const { PromptSuggestionState, sanitizeSuggestion, buildTranscript } =
 	await jiti.import(fileURLToPath(new URL("../lib/prompt-suggestion.ts", import.meta.url)));
+const { installQueueDispatch, dispatchEarliestQueuedMessage, collectQueuedMessages, resolveSession, resolveEditor } =
+	await jiti.import(fileURLToPath(new URL("../lib/queue-dispatch.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
@@ -849,6 +851,139 @@ test("pi-tweaks regression suite", async (t) => {
 			lines = tui.getScreenLines().map(stripTerminalSequences);
 			assert.equal(lines.some((l) => l.includes("dismiss this")), false);
 		} finally { controller(); tui.stop(); }
+	});
+
+	await t.test("empty enter dispatches earliest queued message and re-queues remaining", async () => {
+		let queueSteering = ["steering message 1"];
+		let queueFollowUp = ["follow-up message 2", "follow-up message 3"];
+		let abortCalled = false;
+		let idleWaitCalled = false;
+		let streaming = true;
+		const submitted = [];
+
+		const mockSession = {
+			getSteeringMessages() { return queueSteering; },
+			getFollowUpMessages() { return queueFollowUp; },
+			clearQueue() {
+				const res = { steering: [...queueSteering], followUp: [...queueFollowUp] };
+				queueSteering = [];
+				queueFollowUp = [];
+				return res;
+			},
+			async abort() {
+				abortCalled = true;
+				streaming = false;
+			},
+			async waitForIdle() {
+				idleWaitCalled = true;
+			},
+			async followUp(text) {
+				queueFollowUp.push(text);
+			},
+			get isStreaming() { return streaming; },
+			get isIdle() { return !streaming; },
+		};
+
+		const term = new Terminal();
+		term.columns = 70;
+		term.rows = 15;
+		const scroll = new ScrollView(new Text("CONTENT", 0, 0), { primary: true });
+		const editor = new Editor({ terminal: term }, { borderColor: (s) => s, selectList: {} });
+		editor.onSubmit = (text) => { if (text.trim()) submitted.push(text); };
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+
+		const footerHolder = { session: mockSession, render: () => [] };
+
+		const root = new VStack([
+			{ component: scroll, basis: 0, grow: 1 },
+			{ component: editorContainer, basis: 3, shrink: 0 },
+			{ component: footerHolder, basis: 1, shrink: 0 },
+		]);
+		const tui = new TuiAltScreen(term, false, undefined, {});
+		tui.setLayoutRoot(root);
+		tui.setFocus(editor);
+		tui.start();
+
+		const controller = installPiTweaks(tui, () => theme);
+		try {
+			// Non-empty enter submits normally
+			editor.setText("normal input");
+			term.input("\r");
+			assert.deepEqual(submitted, ["normal input"]);
+			assert.equal(abortCalled, false);
+			assert.deepEqual(queueSteering, ["steering message 1"]);
+
+			// Empty enter with queued messages: dispatches earliest (steering 1), aborts active run, re-queues remaining
+			editor.setText("");
+			term.input("\r");
+			await new Promise((resolve) => setImmediate(resolve));
+
+			assert.deepEqual(submitted, ["normal input", "steering message 1"]);
+			assert.equal(abortCalled, true);
+			assert.equal(idleWaitCalled, true);
+			assert.deepEqual(queueFollowUp, ["follow-up message 2", "follow-up message 3"]);
+
+			// Empty enter again dispatches next earliest ("follow-up message 2")
+			term.input("\r");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.deepEqual(submitted, ["normal input", "steering message 1", "follow-up message 2"]);
+			assert.deepEqual(queueFollowUp, ["follow-up message 3"]);
+
+			// Empty enter again dispatches the last one ("follow-up message 3")
+			term.input("\r");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.deepEqual(submitted, ["normal input", "steering message 1", "follow-up message 2", "follow-up message 3"]);
+			assert.deepEqual(queueFollowUp, []);
+
+			// Queue is now empty: empty enter does nothing
+			term.input("\r");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(submitted.length, 4);
+		} finally { controller(); tui.stop(); }
+	});
+
+	await t.test("dispatchQueuedMessage controller method and unhooking on dispose", async () => {
+		let queue = ["queued task"];
+		const submitted = [];
+		const mockSession = {
+			getSteeringMessages() { return []; },
+			getFollowUpMessages() { return queue; },
+			clearQueue() { const res = { steering: [], followUp: [...queue] }; queue = []; return res; },
+			async abort() {},
+			async waitForIdle() {},
+			async followUp(t) { queue.push(t); },
+			isStreaming: false,
+			isIdle: true,
+		};
+		const term = new Terminal();
+		term.columns = 70;
+		term.rows = 15;
+		const editor = new Editor({ terminal: term }, { borderColor: (s) => s, selectList: {} });
+		const originalSubmit = (t) => { submitted.push(t); };
+		editor.onSubmit = originalSubmit;
+		const root = new VStack([
+			{ component: editor, basis: 3, shrink: 0 },
+			{ component: { session: mockSession, render: () => [] }, basis: 1, shrink: 0 },
+		]);
+		const tui = new TuiAltScreen(term, false, undefined, {});
+		tui.setLayoutRoot(root);
+		tui.start();
+
+		const controller = installPiTweaks(tui, () => theme);
+		assert.notEqual(editor.onSubmit, originalSubmit, "editor.onSubmit should be wrapped");
+
+		const ok = await controller.dispatchQueuedMessage();
+		assert.equal(ok, true);
+		assert.deepEqual(submitted, ["queued task"]);
+		assert.deepEqual(queue, []);
+
+		const okEmpty = await controller.dispatchQueuedMessage();
+		assert.equal(okEmpty, false);
+
+		controller();
+		assert.equal(editor.onSubmit, originalSubmit, "disposing should restore original onSubmit");
+		tui.stop();
 	});
 
 	await t.test("incompatible or regular TUIs are rejected without patching", () => {

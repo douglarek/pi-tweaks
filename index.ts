@@ -24,12 +24,15 @@ import { contains, transcriptContainer, flowChildren, chatEntryBox, questionSnap
 import { createToolCompactor } from "./lib/compact-tools.ts";
 import { PromptSuggestionState, paintPromptSuggestion, handlePromptSuggestionInput,
 	buildTranscript, sanitizeSuggestion } from "./lib/prompt-suggestion.ts";
+import { installQueueDispatch, type QueueDispatchController, type SessionLike } from "./lib/queue-dispatch.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
 	frames?: () => boolean;
 	questionNav?: () => boolean;
 	promptSuggestions?: () => boolean;
+	queueDispatch?: () => boolean;
+	session?: () => SessionLike | undefined;
 }
 export interface PiTweaksController {
 	(): void;
@@ -38,6 +41,7 @@ export interface PiTweaksController {
 	setSuggestion?(text: string | null): void;
 	getSuggestion?(): string | null;
 	clearSuggestion?(): void;
+	dispatchQueuedMessage?(): Promise<boolean>;
 }
 interface NavigationLease {
 	active: boolean;
@@ -123,6 +127,12 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 	let navPress: { point: Pointer; component?: Component; moved: boolean } | undefined;
 	const scrollbarLeases = new Map<ChatScrollView, NavigationLease>();
 	const suggestionState = new PromptSuggestionState();
+	const queueDispatchEnabled = () => options.queueDispatch?.() ?? true;
+	const queueController = installQueueDispatch(ui, {
+		session: options.session,
+		enabled: queueDispatchEnabled,
+		onRequestRender: () => ui.requestRender(),
+	});
 	const framesEnabled = () => options.frames?.() ?? true;
 	const navEnabled = () => options.questionNav?.() ?? true;
 	const suggestionsEnabled = () => options.promptSuggestions?.() ?? true;
@@ -310,7 +320,10 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 	};
 
 	const patchedRender = function (this: HoverTUI): void {
-		if (!disposed) tools.prepare(this.layoutRoot ?? this.currentLayout?.root.component);
+		if (!disposed) {
+			tools.prepare(this.layoutRoot ?? this.currentLayout?.root.component);
+			queueController.checkEditor();
+		}
 		originalRender.call(this);
 	};
 	const minimalIndicator = () => disposed ? originalIndicator?.() ?? "" : getTheme().fg("muted", " ↓ ");
@@ -326,6 +339,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 	const dispose = () => {
 		if (disposed) return;
 		disposed = true;
+		queueController.dispose();
 		pointer = undefined;
 		navPress = undefined;
 		lastRail = undefined;
@@ -371,6 +385,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 				ui.requestRender(true);
 			}
 		},
+		dispatchQueuedMessage: () => queueController.dispatchNow(),
 	});
 }
 

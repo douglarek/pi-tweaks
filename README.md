@@ -69,6 +69,10 @@ When a turn finishes and the editor is idle, the extension asks the model to pre
 - Typing matching characters shrinks the ghost text in real time; divergent typing hides it.
 - **Esc** on an empty prompt dismisses the prediction.
 
+### Empty Enter queue dispatch
+
+When messages are queued while the agent is executing, pressing `Enter` in an empty editor immediately dispatches the earliest queued message. If a response is running, it is cancelled and the earliest message starts executing; any remaining queued messages stay in order in the follow-up queue.
+
 ### Native interactions stay native
 
 Text selection/copy, links, thinking expansion, tool expansion, keyboard focus, and overlays remain on Pi's normal input path. Brackets and previews are screen decorations, not transcript text.
