@@ -22,16 +22,22 @@ import { contains, transcriptContainer, flowChildren, chatEntryBox, questionSnap
 	type LayoutBox, type LayoutFrame, type Pointer, type ChatScrollView, type ScrollbarMode,
 	type QuestionRail } from "./lib/question-navigation.ts";
 import { createToolCompactor } from "./lib/compact-tools.ts";
+import { PromptSuggestionState, paintPromptSuggestion, handlePromptSuggestionInput,
+	buildTranscript, sanitizeSuggestion } from "./lib/prompt-suggestion.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
 	frames?: () => boolean;
 	questionNav?: () => boolean;
+	promptSuggestions?: () => boolean;
 }
 export interface PiTweaksController {
 	(): void;
 	jumpToQuestion(index: number): boolean;
 	questionCount(): number;
+	setSuggestion?(text: string | null): void;
+	getSuggestion?(): string | null;
+	clearSuggestion?(): void;
 }
 interface NavigationLease {
 	active: boolean;
@@ -116,8 +122,10 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 	let selectedQuestion: Component | undefined;
 	let navPress: { point: Pointer; component?: Component; moved: boolean } | undefined;
 	const scrollbarLeases = new Map<ChatScrollView, NavigationLease>();
+	const suggestionState = new PromptSuggestionState();
 	const framesEnabled = () => options.frames?.() ?? true;
 	const navEnabled = () => options.questionNav?.() ?? true;
+	const suggestionsEnabled = () => options.promptSuggestions?.() ?? true;
 	const term = process.env.TERM?.toLowerCase() ?? "";
 	const insideMux = process.env.TMUX !== undefined || process.env.ZELLIJ !== undefined ||
 		process.env.STY !== undefined || term.startsWith("tmux") || term.startsWith("screen");
@@ -199,6 +207,10 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		const previousSelected = selectedQuestion;
 		const previousHit = navHoverKey();
 		const mouse = MOUSE_MOVE.exec(data);
+		if (!mouse && suggestionsEnabled() && !ui.hasOverlay()) {
+			const outcome = handlePromptSuggestionInput(data, ui.currentLayout, suggestionState, () => ui.requestRender());
+			if (outcome) return outcome;
+		}
 		const button = mouse ? Number(mouse[1]) : 0;
 		const point = mouse ? { x: Number(mouse[2]) - 1, y: Number(mouse[3]) - 1 } : undefined;
 		const release = mouse?.[4] === "m";
@@ -289,8 +301,12 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		// Screen-only chrome: native copy uses the unchanged document, never these decorations.
 		const result = originalPaint.call(this, decorated, layout, width);
 		lastRail = disposed ? undefined : navigationRail(layout, width);
-		return lastRail ? paintQuestionNavigation(result, lastRail, getTheme(), width,
+		let finalScreen = lastRail ? paintQuestionNavigation(result, lastRail, getTheme(), width,
 			ui.hasOverlay() || nativeGesture() ? undefined : pointer, !ui.hasActiveSelection()) : result;
+		if (!disposed && suggestionsEnabled() && !ui.hasOverlay()) {
+			finalScreen = paintPromptSuggestion(finalScreen, layout, suggestionState, getTheme(), width);
+		}
+		return finalScreen;
 	};
 
 	const patchedRender = function (this: HoverTUI): void {
@@ -313,6 +329,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		pointer = undefined;
 		navPress = undefined;
 		lastRail = undefined;
+		suggestionState.clear();
 		tools.restore();
 		restoreScrollbars();
 		if (ui.doRender === patchedRender) {
@@ -334,8 +351,27 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		if (insideMux) ui.terminal.write("\x1b[?1003l");
 		ui.requestRender();
 	};
-	return Object.assign(dispose, { jumpToQuestion: (index: number) => jumpToQuestion(index),
-		questionCount: () => questionSnapshot(ui.currentLayout)?.questions.length ?? 0 });
+	return Object.assign(dispose, {
+		jumpToQuestion: (index: number) => jumpToQuestion(index),
+		questionCount: () => questionSnapshot(ui.currentLayout)?.questions.length ?? 0,
+		setSuggestion: (text: string | null) => {
+			suggestionState.setSuggestion(text);
+			if (typeof (ui as unknown as { renderNow?: (force?: boolean) => void }).renderNow === "function") {
+				(ui as unknown as { renderNow: (force?: boolean) => void }).renderNow(true);
+			} else {
+				ui.requestRender(true);
+			}
+		},
+		getSuggestion: () => suggestionState.getSuggestion(),
+		clearSuggestion: () => {
+			suggestionState.clear();
+			if (typeof (ui as unknown as { renderNow?: (force?: boolean) => void }).renderNow === "function") {
+				(ui as unknown as { renderNow: (force?: boolean) => void }).renderNow(true);
+			} else {
+				ui.requestRender(true);
+			}
+		},
+	});
 }
 
 export default function piTweaks(pi: ExtensionAPI): void {
@@ -362,6 +398,77 @@ export default function piTweaks(pi: ExtensionAPI): void {
 		});
 	});
 	pi.on("session_shutdown", remove);
+
+	pi.on("agent_settled", async (event, ctx) => {
+		if (event.aborted) {
+			detach?.clearSuggestion?.();
+			return;
+		}
+		if (!detach || !ctx.hasUI || ctx.mode !== "tui") return;
+		if (ctx.ui.getEditorText().trim() !== "") return;
+		if (ctx.hasPendingMessages() || !ctx.isIdle()) return;
+
+		const model = ctx.model;
+		if (!model || !ctx.modelRegistry) return;
+
+		const entries = ctx.sessionManager.getEntries();
+		const transcript = buildTranscript(entries);
+		if (!transcript) return;
+
+		const systemPrompt = "You predict the next line the USER will type into their coding agent.\n" +
+			"You see a transcript. The last line is from the agent.\n" +
+			"Write only that next user line, or NONE.\n\n" +
+			"Predict what they would type, not what you think they should do.\n" +
+			"A wrong line is worse than NONE.\n" +
+			"Write NONE if the next line is long, new, or not obvious.\n" +
+			"Never write filler, a question, or agent voice.\n\n" +
+			"If you write a line, use 2-12 words in their style.\n" +
+			"Reply with only the line or NONE.";
+
+		const userPrompt = `CWD: ${ctx.cwd}\n\nTranscript:\n\n${transcript}\n\nPredict the user's next message. Reply with ONLY the suggestion text.`;
+
+		try {
+			const result = await ctx.modelRegistry.complete(
+				model,
+				{
+					messages: [
+						{ role: "system", content: systemPrompt },
+						{ role: "user", content: userPrompt },
+					],
+				},
+				{ maxTokens: 48, temperature: 0.2 },
+			);
+
+			let raw = "";
+			if (typeof result?.content === "string") {
+				raw = result.content;
+			} else if (Array.isArray(result?.content)) {
+				raw = result.content
+					.filter((part: unknown): part is { type: string; text: string } =>
+						typeof part === "object" && part !== null &&
+						(part as { type?: string }).type === "text" &&
+						typeof (part as { text?: string }).text === "string")
+					.map((part) => part.text)
+					.join("");
+			}
+
+			const sanitized = sanitizeSuggestion(raw);
+			if (sanitized && ctx.ui.getEditorText().trim() === "") {
+				detach.setSuggestion?.(sanitized);
+			}
+		} catch {
+			// Silently ignore completion errors (e.g. offline, auth, rate limit)
+		}
+	});
+
+	pi.on("user_bash", () => {
+		detach?.clearSuggestion?.();
+	});
+
+	pi.on("before_agent_start", () => {
+		detach?.clearSuggestion?.();
+	});
+
 	pi.registerCommand("question-nav", {
 		description: "Scroll to a user question: /question-nav <question number>",
 		handler: async (args, ctx) => {

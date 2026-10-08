@@ -59,6 +59,16 @@ The arrows and mouse wheel over the rail move between questions. `/question-nav 
 
 Navigation only changes the viewport. It does not change the active conversation branch, message history, model context, or the editor's draft.
 
+### Next-prompt suggestions (ghost text)
+
+When a turn finishes and the editor is idle, the extension asks the model to predict the user's likely next prompt. The prediction appears as dim ghost text directly following the cursor in the input box:
+
+![A predicted next prompt rendered as dim ghost text inside the editor.](docs/images/prompt-suggestion.png)
+
+- **Tab** or **Right arrow** accepts the prediction and fills the input.
+- Typing matching characters shrinks the ghost text in real time; divergent typing hides it.
+- **Esc** on an empty prompt dismisses the prediction.
+
 ### Native interactions stay native
 
 Text selection/copy, links, thinking expansion, tool expansion, keyboard focus, and overlays remain on Pi's normal input path. Brackets and previews are screen decorations, not transcript text.

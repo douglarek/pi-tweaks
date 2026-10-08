@@ -36,6 +36,8 @@ const installAiHoverFrame = (tui, getTheme, options = {}) =>
 const { questionSnapshot, computeQuestionRail, railHit, railContains, railGutterContains,
 	NAV_RIGHT_PADDING, NAV_HIT_WIDTH, NAV_GUTTER_WIDTH, cleanQuestion } =
 	await jiti.import(fileURLToPath(new URL("../lib/question-navigation.ts", import.meta.url)));
+const { PromptSuggestionState, sanitizeSuggestion, buildTranscript } =
+	await jiti.import(fileURLToPath(new URL("../lib/prompt-suggestion.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
@@ -43,6 +45,8 @@ const { getThemeByName } = await import(`${pkg}/dist/modes/interactive/theme/the
 const { createInteractiveTuiReference } = await import(`${pkg}/dist/modes/interactive/tui-renderer.js`);
 const { Box, Container, ScrollView, Text, TuiAltScreen, VStack, sliceByColumn, stripTerminalSequences, visibleWidth } =
 	await import(pathToFileURL(require.resolve("@earendil-works/pi-tui")).href);
+const { Editor } =
+	await import(pathToFileURL(require.resolve("@earendil-works/pi-tui/dist/components/editor.js")).href);
 initTheme("dark");
 const theme = getThemeByName("dark");
 
@@ -759,6 +763,92 @@ test("pi-tweaks regression suite", async (t) => {
 			assert.equal(f.tui.handleViewportInput, originalInput);
 			assert.equal(f.scroll.scrollbar, "hidden");
 		} finally { life.handlers.get("session_shutdown")({}, life.ctx); f.tui.stop(); rmSync(dir, { recursive: true, force: true }); }
+	});
+
+	await t.test("prompt suggestion state, sanitizer, and transcript compaction", () => {
+		assert.equal(sanitizeSuggestion("\"Run the tests\""), "Run the tests");
+		assert.equal(sanitizeSuggestion("`git status`"), "git status");
+		assert.equal(sanitizeSuggestion("NONE"), null);
+		assert.equal(sanitizeSuggestion("none."), null);
+		assert.equal(sanitizeSuggestion("n/a"), null);
+		assert.equal(sanitizeSuggestion(""), null);
+
+		const transcript = buildTranscript([
+			{ type: "message", message: { role: "user", content: "How does this work?" } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Here is the explanation." }] } },
+		]);
+		assert.ok(transcript.includes("User: How does this work?"));
+		assert.ok(transcript.includes("Agent: Here is the explanation."));
+
+		const state = new PromptSuggestionState();
+		assert.equal(state.getGhost(""), null);
+		state.setSuggestion("run the tests");
+		assert.equal(state.getGhost(""), "run the tests");
+		assert.equal(state.getGhost("run "), "the tests");
+		assert.equal(state.getGhost("other"), null);
+		assert.equal(state.accept("other"), null);
+		assert.equal(state.accept("run "), "run the tests");
+		assert.equal(state.getGhost(""), null);
+
+		state.setSuggestion("another prompt");
+		state.dismiss();
+		assert.equal(state.getGhost(""), null);
+	});
+
+	await t.test("prompt suggestions render ghost text and Tab, Right arrow, and Esc handle interactions", () => {
+		const term = new Terminal();
+		term.columns = 70;
+		term.rows = 15;
+		const scroll = new ScrollView(new Text("CONTENT", 0, 0), { primary: true });
+		const editor = new Editor({ terminal: term }, { borderColor: (s) => s, selectList: {} });
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		const root = new VStack([
+			{ component: scroll, basis: 0, grow: 1 },
+			{ component: editorContainer, basis: 3, shrink: 0 },
+		]);
+		const tui = new TuiAltScreen(term, false, undefined, {});
+		tui.setLayoutRoot(root);
+		tui.setFocus(editor);
+		tui.start();
+
+		const controller = installPiTweaks(tui, () => theme);
+		try {
+			controller.setSuggestion("代码在哪里实现的？");
+			tui.renderNow();
+			let lines = tui.getScreenLines().map(stripTerminalSequences);
+			assert.ok(lines.some((l) => l.includes("代码在哪里实现的？")));
+
+			// Tab accepts
+			term.input("\t");
+			tui.renderNow();
+			assert.equal(editor.getText(), "代码在哪里实现的？");
+			lines = tui.getScreenLines().map(stripTerminalSequences);
+			assert.doesNotMatch(lines.join("\n"), /代码在哪里实现的？.*代码在哪里实现的？/);
+
+			// Clear editor and set another suggestion
+			editor.setText("");
+			controller.setSuggestion("second suggestion");
+			tui.renderNow();
+			lines = tui.getScreenLines().map(stripTerminalSequences);
+			assert.ok(lines.some((l) => l.includes("second suggestion")));
+
+			// Right arrow accepts
+			term.input("\x1b[C");
+			tui.renderNow();
+			assert.equal(editor.getText(), "second suggestion");
+
+			// Clear and test Esc dismiss
+			editor.setText("");
+			controller.setSuggestion("dismiss this");
+			tui.renderNow();
+			lines = tui.getScreenLines().map(stripTerminalSequences);
+			assert.ok(lines.some((l) => l.includes("dismiss this")));
+			term.input("\x1b");
+			tui.renderNow();
+			lines = tui.getScreenLines().map(stripTerminalSequences);
+			assert.equal(lines.some((l) => l.includes("dismiss this")), false);
+		} finally { controller(); tui.stop(); }
 	});
 
 	await t.test("incompatible or regular TUIs are rejected without patching", () => {
