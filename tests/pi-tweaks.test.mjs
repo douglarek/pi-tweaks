@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -42,6 +42,8 @@ const { installQueueDispatch, dispatchEarliestQueuedMessage, collectQueuedMessag
 	await jiti.import(fileURLToPath(new URL("../lib/queue-dispatch.ts", import.meta.url)));
 const { shortenPath, renderCompactFooter, installCompactFooter, resolveFooter, formatTokens, formatCwdForFooter } =
 	await jiti.import(fileURLToPath(new URL("../lib/compact-footer.ts", import.meta.url)));
+const { displayPath, expandTilde, cleanPathArg, resolveTargetDir, formatRelativeTime, collectRecentDirs, getSubdirectories, installDashboardCommands, SessionChoiceComponent } =
+	await jiti.import(fileURLToPath(new URL("../lib/dashboard.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
@@ -488,7 +490,7 @@ test("pi-tweaks regression suite", async (t) => {
 			life.handlers.get("session_start")({}, life.ctx);
 			assert.equal(hasBracket(f.hover()), true);
 			assert.deepEqual([...life.widgets.values()][0].render(60), []);
-			assert.deepEqual([...life.commands.keys()], ["question-nav"]);
+			assert.deepEqual([...life.commands.keys()], ["question-nav", "dashboard", "db", "cd"]);
 			life.handlers.get("session_shutdown")({ reason: "reload" }, life.ctx);
 			assert.equal(f.tui.handleViewportInput, originalInput);
 			assert.equal(hasBracket(f.hover()), false);
@@ -1166,5 +1168,86 @@ test("pi-tweaks regression suite", async (t) => {
 			assert.throws(() => installAiHoverFrame(ui, () => theme), /compatible fullscreen/);
 			assert.deepEqual(Object.keys(ui), ["mode"]);
 		}
+	});
+
+	await t.test("dashboard: path formatting and tilde expansion", () => {
+		const home = homedir();
+		assert.equal(displayPath(home), "~");
+		assert.equal(displayPath(join(home, "work", "repo")), "~/work/repo");
+		assert.equal(displayPath("/var/log"), "/var/log");
+
+		assert.equal(expandTilde("~"), home);
+		assert.equal(expandTilde("~/projects"), join(home, "projects"));
+		assert.equal(expandTilde("/etc/hosts"), "/etc/hosts");
+
+		// Test quote stripping
+		assert.equal(cleanPathArg('"/Users/admin/work"'), "/Users/admin/work");
+		assert.equal(cleanPathArg("'/Users/admin/work'"), "/Users/admin/work");
+		assert.equal(resolveTargetDir('"/Users/admin/work"', "/tmp"), "/Users/admin/work");
+		assert.equal(resolveTargetDir('"~/work"', "/tmp"), join(home, "work"));
+	});
+
+	await t.test("dashboard: formatRelativeTime handles ranges properly", () => {
+		const now = Date.now();
+		assert.equal(formatRelativeTime(now - 10 * 1000), "just now");
+		assert.equal(formatRelativeTime(now - 5 * 60 * 1000), "5m ago");
+		assert.equal(formatRelativeTime(now - 2 * 3600 * 1000), "2h ago");
+		assert.equal(formatRelativeTime(now - 3 * 86400 * 1000), "3d ago");
+		assert.equal(formatRelativeTime(now - 65 * 86400 * 1000), "2mo ago");
+	});
+
+	await t.test("dashboard: collectRecentDirs extracts unique project paths with cwd at top", () => {
+		const currentCwd = process.cwd();
+		const mockSessions = [
+			{ cwd: currentCwd, modified: new Date(Date.now() - 100000) },
+			{ cwd: "/tmp", modified: new Date(Date.now() - 50000) },
+			{ cwd: currentCwd, modified: new Date(Date.now() - 20000) },
+		];
+		const dirs = collectRecentDirs(mockSessions, currentCwd);
+		assert.equal(dirs[0].path, currentCwd);
+		assert.ok(dirs.some((d) => d.path === "/tmp"));
+		assert.equal(dirs.filter((d) => d.path === currentCwd).length, 1, "cwd must be deduplicated");
+	});
+
+	await t.test("dashboard: getSubdirectories lists directories in valid paths", () => {
+		const subdirs = getSubdirectories("/tmp", process.cwd());
+		assert.ok(Array.isArray(subdirs));
+	});
+
+	await t.test("dashboard: installDashboardCommands registers all commands and shortcuts", () => {
+		const commands = new Map();
+		const shortcuts = new Map();
+		const mockPi = {
+			registerCommand: (name, def) => commands.set(name, def),
+			registerShortcut: (key, def) => shortcuts.set(key, def),
+		};
+		installDashboardCommands(mockPi);
+		assert.ok(commands.has("dashboard"), "must register /dashboard");
+		assert.ok(commands.has("db"), "must register /db");
+		assert.ok(commands.has("cd"), "must register /cd");
+		assert.ok(shortcuts.has("ctrl+l"), "must register ctrl+l shortcut");
+		assert.ok(shortcuts.has("ctrl+\\"), "must register ctrl+\\ shortcut");
+	});
+
+	await t.test("dashboard: SessionChoiceComponent shows + New Session at top and supports selection", () => {
+		const mockSessions = [
+			{ path: "/tmp/s1.jsonl", cwd: "/tmp", modified: new Date(), messageCount: 5, firstMessage: "hello" },
+			{ path: "/tmp/s2.jsonl", cwd: "/tmp", modified: new Date(Date.now() - 10000), messageCount: 2, firstMessage: "world" },
+		];
+		let chosen = null;
+		const mockTui = { requestRender: () => {} };
+		const comp = new SessionChoiceComponent(mockTui, "/tmp", mockSessions, theme, (res) => { chosen = res; });
+		const rendered = comp.render(80);
+		assert.ok(rendered.some((l) => l.includes("+ New Session")), "must contain + New Session at top");
+
+		// Enter on 0 selects new
+		comp.handleInput("\r");
+		assert.deepEqual(chosen, { action: "new" });
+
+		// Down then Enter selects first session
+		comp.handleInput("\x1b[B"); // down arrow
+		comp.handleInput("\r");
+		assert.equal(chosen?.action, "attach");
+		assert.equal(chosen?.session?.path, "/tmp/s1.jsonl");
 	});
 });

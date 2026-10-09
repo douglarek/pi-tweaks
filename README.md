@@ -80,6 +80,40 @@ Pi's default multi-line status bar is consolidated into a single clean line:
 - Long paths are automatically shortened with middle ellipsis while keeping the Git branch completely intact.
 - Hovering the mouse over the path immediately expands it to show the full directory path (with terminal OSC 8 hyperlink support).
 
+### Agent Dashboard and session switcher
+
+Run `/dashboard` (or `/db`, or press `Ctrl+\`) to open the interactive agent dashboard modeled after grok-build:
+
+![Agent dashboard modal with + New Session at the top and cross-project session history.](docs/images/dashboard.png)
+
+- **+ New Session**: Placed right at the top so you can start a fresh conversation immediately by pressing `Enter`.
+- **Cross-project history**: Lists historical sessions across all directories with their titles, prompts, relative timestamps, and message counts.
+- **Project scoping**: Press `Tab` to toggle between `[All Projects]` and `[Current Project]`.
+- **Search filtering**: Type any query to filter sessions in real time.
+- **Instant attachment**: Press `Enter` on any session to switch to it and update the working directory immediately.
+
+### Workspace switcher and location picker
+
+Press `Ctrl+L` or run `/cd [path]` to change working directory:
+
+![Workspace session selector showing + New Session at the top along with recent conversations.](docs/images/workspace-choice.png)
+
+- **Direct path navigation**: `/cd <path>` resolves tilde (`~`), quotes, and relative paths.
+- **Interactive location picker**: Pressing `Ctrl+L` or running `/cd` without arguments opens the directory picker with recent projects and real-time filesystem path completion.
+- **Workspace session picker**: When switching to a project directory with existing conversations, a session picker appears with **`+ New Session` at the very top**, followed by recent conversations. Press `Enter` to start fresh, or press `Down` to resume a recent session.
+
+#### Freeing `Ctrl+L` (Keybinding configuration)
+
+By default, Pi reserves `Ctrl+L` for its built-in `app.model.select` action and skips extension shortcuts using that key with a conflict warning. To release `Ctrl+L` for the workspace location picker, configure `~/.pi/agent/keybindings.json`:
+
+```json
+{
+  "app.model.select": []
+}
+```
+
+> **Tip**: You can still change models anytime with `/model` or `Ctrl+P`, or remap the model selector to another key (e.g. `"app.model.select": "ctrl+m"`). If you prefer not to modify keybindings, you can always open the location picker via `/cd` and the dashboard via `Ctrl+\` or `/dashboard`.
+
 ### Native interactions stay native
 
 Text selection/copy, links, thinking expansion, tool expansion, keyboard focus, and overlays remain on Pi's normal input path. Brackets and previews are screen decorations, not transcript text.

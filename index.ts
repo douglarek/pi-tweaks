@@ -26,6 +26,8 @@ import { PromptSuggestionState, paintPromptSuggestion, handlePromptSuggestionInp
 	buildTranscript, sanitizeSuggestion } from "./lib/prompt-suggestion.ts";
 import { installQueueDispatch, type QueueDispatchController, type SessionLike } from "./lib/queue-dispatch.ts";
 import { installCompactFooter, type CompactFooterController } from "./lib/compact-footer.ts";
+import { installDashboardCommands, registerDashboardTui, registerDashboardSession, registerDashboardEditor } from "./lib/dashboard.ts";
+import { resolveSession, resolveEditor } from "./lib/queue-dispatch.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
@@ -142,6 +144,11 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		enabled: footerEnabled,
 	});
 	footerController.checkFooter(ui.layoutRoot ?? ui.currentLayout?.root.component);
+	registerDashboardTui(ui);
+	const resolvedSess = options.session?.() ?? resolveSession(ui.layoutRoot ?? ui.currentLayout?.root?.component);
+	if (resolvedSess) registerDashboardSession(resolvedSess);
+	const resolvedEd = resolveEditor(ui.layoutRoot ?? ui.currentLayout?.root?.component);
+	if (resolvedEd) registerDashboardEditor(resolvedEd);
 	const framesEnabled = () => options.frames?.() ?? true;
 	const navEnabled = () => options.questionNav?.() ?? true;
 	const suggestionsEnabled = () => options.promptSuggestions?.() ?? true;
@@ -382,6 +389,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 			else delete (ui as Partial<HoverTUI>).compositeScrollToEndIndicator;
 		}
 		if (insideMux) ui.terminal.write("\x1b[?1003l");
+		registerDashboardTui(null);
 		ui.requestRender();
 	};
 	return Object.assign(dispose, {
@@ -522,4 +530,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 			}
 		},
 	});
+
+	// Register Dashboard & Location Picker commands and shortcuts (Ctrl+L, Ctrl+\, /dashboard, /cd)
+	installDashboardCommands(pi);
 }

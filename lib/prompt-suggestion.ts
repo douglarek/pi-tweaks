@@ -138,7 +138,7 @@ export function findEditorBox(box: LayoutBox): { box: LayoutBox; editor: EditorL
 	if (Array.isArray((box.component as { children?: Component[] })?.children)) {
 		let y = box.rect.y;
 		for (const child of (box.component as { children: Component[] }).children) {
-			const height = typeof child.render === "function" ? child.render(box.rect.width).length : box.rect.height;
+			const height = (child as { rect?: { height: number } }).rect?.height ?? box.rect.height;
 			const childBox: LayoutBox = { component: child, rect: { x: box.rect.x, y, width: box.rect.width, height }, clip: box.clip, children: [] };
 			const found = findEditorBox(childBox);
 			if (found) return found;
