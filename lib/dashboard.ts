@@ -7,14 +7,12 @@
  *   inline directory path completion, project scope toggling, and instant session attachment.
  * - /cd [path]: Change working directory for Pi. Without arguments, opens the Location Picker modal.
  *   Supports Tab argument completion directly in the main editor.
- * - Ctrl+L: Opens the Location Picker directly from the editor or within the Dashboard.
+ * - Ctrl+L (inside Dashboard): Switches to the Location Picker in-place with zero flicker.
  *
- * UX enhancements:
- * - Full Kitty keyboard protocol (CSI-u) printable decoding, bracketed paste, and Ctrl+W path segment deletion.
- * - Live filesystem directory completion with Tab in both Location Picker and Dashboard.
- * - Automatically discovers sibling workspace directories in addition to session history.
- * - When switching workspace, shows target directory's sessions with "+ New Session" at the very top.
- * - Instant session and directory switching upon Enter.
+ * Flicker-free architecture:
+ * - All views (Dashboard, Location Picker, Workspace Sessions) share an identical 19-line,
+ *   fixed-width frame and transition in-place within a single custom TUI session without
+ *   tearing down the editor container or triggering terminal viewport reflows.
  */
 
 import * as fs from "node:fs";
@@ -40,6 +38,11 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 import { resolveEditor, resolveSession } from "./queue-dispatch.ts";
+
+// Unified modal geometry across all subviews to prevent any layout reflow or flicker
+const MODAL_MIN_WIDTH = 50;
+const MODAL_MAX_WIDTH = 86;
+const MODAL_VISIBLE_ROWS = 11;
 
 // Cached references for instant session switching
 let lastCommandCtx: ExtensionCommandContext | null = null;
@@ -489,7 +492,9 @@ export class SessionChoiceComponent implements Component, Focusable {
 	private tui: TUI;
 	private targetDir: string;
 	private branch: string | null;
-	private sessions: SessionInfo[];
+	private allSessions: SessionInfo[];
+	private filteredSessions: SessionInfo[];
+	private query = "";
 	private selectedIndex = 0; // 0 is "+ New Session"
 	private scrollOffset = 0;
 	private theme: Theme;
@@ -505,9 +510,22 @@ export class SessionChoiceComponent implements Component, Focusable {
 		this.tui = tui;
 		this.targetDir = path.resolve(targetDir);
 		this.branch = getGitBranch(this.targetDir);
-		this.sessions = sessions;
+		this.allSessions = sessions;
+		this.filteredSessions = sessions;
 		this.theme = theme;
 		this.done = done;
+	}
+
+	private updateFilter(): void {
+		const q = cleanPathArg(this.query).toLowerCase();
+		if (!q) {
+			this.filteredSessions = this.allSessions;
+			return;
+		}
+		this.filteredSessions = this.allSessions.filter((s) => {
+			const key = `${s.name || ""} ${s.firstMessage || ""} ${s.id}`.toLowerCase();
+			return key.includes(q);
+		});
 	}
 
 	handleInput(data: string): void {
@@ -518,7 +536,7 @@ export class SessionChoiceComponent implements Component, Focusable {
 			return;
 		}
 
-		const totalCount = 1 + this.sessions.length;
+		const totalCount = 1 + this.filteredSessions.length;
 
 		if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
 			if (this.selectedIndex > 0) {
@@ -556,15 +574,48 @@ export class SessionChoiceComponent implements Component, Focusable {
 			if (this.selectedIndex === 0) {
 				this.done({ action: "new" });
 			} else {
-				const selected = this.sessions[this.selectedIndex - 1];
-				this.done({ action: "attach", session: selected });
+				const selected = this.filteredSessions[this.selectedIndex - 1];
+				if (selected) {
+					this.done({ action: "attach", session: selected });
+				}
 			}
 			return;
+		}
+
+		if (matchesKey(data, "ctrl+u")) {
+			if (this.query.length > 0) {
+				this.query = "";
+				this.selectedIndex = 0;
+				this.scrollOffset = 0;
+				this.updateFilter();
+				this.tui.requestRender();
+			}
+			return;
+		}
+
+		if (matchesKey(data, "backspace")) {
+			if (this.query.length > 0) {
+				this.query = this.query.slice(0, -1);
+				this.selectedIndex = 0;
+				this.scrollOffset = 0;
+				this.updateFilter();
+				this.tui.requestRender();
+			}
+			return;
+		}
+
+		const printable = extractPrintableInput(data);
+		if (printable !== undefined) {
+			this.query += printable;
+			this.selectedIndex = 0;
+			this.scrollOffset = 0;
+			this.updateFilter();
+			this.tui.requestRender();
 		}
 	}
 
 	private adjustScroll(): void {
-		const visibleRows = 9;
+		const visibleRows = MODAL_VISIBLE_ROWS;
 		if (this.selectedIndex < this.scrollOffset) {
 			this.scrollOffset = this.selectedIndex;
 		} else if (this.selectedIndex >= this.scrollOffset + visibleRows) {
@@ -575,7 +626,7 @@ export class SessionChoiceComponent implements Component, Focusable {
 	render(width: number): string[] {
 		const th = this.theme;
 		const lines: string[] = [];
-		const modalW = Math.max(48, Math.min(width, 76));
+		const modalW = Math.max(MODAL_MIN_WIDTH, Math.min(width, MODAL_MAX_WIDTH));
 
 		const pad = (str: string, len: number) => {
 			const vw = visibleWidth(str);
@@ -596,21 +647,27 @@ export class SessionChoiceComponent implements Component, Focusable {
 			return `  ${th.fg("border", `├─`)}${l}${th.fg("border", `${"─".repeat(rem)}┤`)}`;
 		};
 
-		// Top header
+		// Line 0..1: Top header
 		lines.push("");
 		const title = ` ${th.bold(th.fg("accent", "Workspace Sessions"))} `;
 		const topRem = Math.max(0, modalW - 4 - visibleWidth(title));
 		lines.push(`  ${th.fg("border", `╭─`)}${title}${th.fg("border", `${"─".repeat(topRem)}╮`)}`);
 
-		// Workspace location row
+		// Line 2: Workspace location row
 		const branchStr = this.branch ? th.fg("muted", ` (${this.branch})`) : "";
 		lines.push(row(`${th.fg("dim", "workspace:")} ${th.fg("text", displayPath(this.targetDir))}${branchStr}`));
 
+		// Line 3: Filter bar
+		const placeholder = !this.query ? th.fg("dim", "Enter for + New Session, ↓ for history, or type to filter") : "";
+		const filterLine = `${th.fg("accent", "filter: ")}${th.fg("text", this.query)}${CURSOR_MARKER}${placeholder}`;
+		lines.push(row(truncateToWidth(filterLine, modalW - 4)));
+
+		// Line 4: Divider
 		lines.push(div(th.fg("dim", "Select session or start new")));
 
-		// Items: item 0 is "+ New Session", items 1..N are sessions
-		const totalCount = 1 + this.sessions.length;
-		const visibleRows = 9;
+		// Lines 5..15: Items (MODAL_VISIBLE_ROWS = 11)
+		const totalCount = 1 + this.filteredSessions.length;
+		const visibleRows = MODAL_VISIBLE_ROWS;
 		const sliceStart = this.scrollOffset;
 
 		for (let i = 0; i < visibleRows; i++) {
@@ -634,9 +691,9 @@ export class SessionChoiceComponent implements Component, Focusable {
 				lines.push(row(`${leftPart}${" ".repeat(rightPad)}${rightPart}`));
 			} else {
 				// Existing session
-				const s = this.sessions[itemIdx - 1];
+				const s = this.filteredSessions[itemIdx - 1];
 				let titleText = s.name || (s.firstMessage ? s.firstMessage.split("\n")[0].trim() : s.id.slice(0, 8));
-				titleText = titleText.slice(0, 32);
+				titleText = titleText.slice(0, 38);
 
 				const titleFormatted = isSel ? th.bold(th.fg("accent", titleText)) : th.fg("text", titleText);
 				const timeFormatted = th.fg("dim", formatRelativeTime(s.modified));
@@ -650,8 +707,8 @@ export class SessionChoiceComponent implements Component, Focusable {
 			}
 		}
 
-		// Footer
-		lines.push(div(th.fg("dim", "↑↓ nav  •  Enter select  •  Esc cancel")));
+		// Line 16..18: Footer
+		lines.push(div(th.fg("dim", "↑↓ nav  •  Enter select  •  Esc back/cancel")));
 		lines.push(`  ${th.fg("border", `╰${"─".repeat(modalW - 2)}╯`)}`);
 		lines.push("");
 
@@ -800,7 +857,7 @@ export class LocationPickerComponent implements Component, Focusable {
 			return;
 		}
 
-		// Allow opening Dashboard from Location Picker via Ctrl+\
+		// Allow returning to Dashboard from Location Picker via Ctrl+\
 		if (matchesKey(data, "ctrl+\\")) {
 			this.done({ action: "open_dashboard" });
 			return;
@@ -925,7 +982,7 @@ export class LocationPickerComponent implements Component, Focusable {
 	}
 
 	private adjustScroll(): void {
-		const visibleRows = 9;
+		const visibleRows = MODAL_VISIBLE_ROWS;
 		if (this.selectedIndex < this.scrollOffset) {
 			this.scrollOffset = this.selectedIndex;
 		} else if (this.selectedIndex >= this.scrollOffset + visibleRows) {
@@ -936,7 +993,7 @@ export class LocationPickerComponent implements Component, Focusable {
 	render(width: number): string[] {
 		const th = this.theme;
 		const lines: string[] = [];
-		const modalW = Math.max(40, Math.min(width, 76));
+		const modalW = Math.max(MODAL_MIN_WIDTH, Math.min(width, MODAL_MAX_WIDTH));
 
 		const pad = (str: string, len: number) => {
 			const vw = visibleWidth(str);
@@ -957,23 +1014,23 @@ export class LocationPickerComponent implements Component, Focusable {
 			return `  ${th.fg("border", `├─`)}${l}${th.fg("border", `${"─".repeat(rem)}┤`)}`;
 		};
 
-		// Top border
+		// Line 0..1: Top border
 		lines.push("");
 		const title = ` ${th.bold(th.fg("accent", "Change Working Directory"))} `;
 		const topRem = Math.max(0, modalW - 4 - visibleWidth(title));
 		lines.push(`  ${th.fg("border", `╭─`)}${title}${th.fg("border", `${"─".repeat(topRem)}╮`)}`);
 
-		// Current CWD row (uses cached branch)
+		// Line 2: Current CWD row (uses cached branch)
 		const branchStr = this.branch ? th.fg("muted", ` (${this.branch})`) : "";
 		lines.push(row(`${th.fg("dim", "current:")} ${th.fg("text", displayPath(this.baseCwd))}${branchStr}`));
 
-		// Path input field with placeholder hint when empty
+		// Line 3: Path input field with placeholder hint when empty
 		const inputPrefix = th.fg("accent", "path: ");
 		const placeholder = !this.query ? th.fg("dim", "type path (~/, ../, /) or name, Tab to complete") : "";
 		const queryDisplay = `${th.fg("text", this.query)}${CURSOR_MARKER}${placeholder}`;
 		lines.push(row(truncateToWidth(`${inputPrefix}${queryDisplay}`, modalW - 4)));
 
-		// Error line or divider
+		// Line 4: Error line or divider
 		if (this.error) {
 			lines.push(div(th.fg("error", `✗ ${this.error}`)));
 		} else {
@@ -981,8 +1038,8 @@ export class LocationPickerComponent implements Component, Focusable {
 			lines.push(div(th.fg("dim", modeLabel)));
 		}
 
-		// Candidate rows
-		const visibleRows = 9;
+		// Lines 5..15: Candidate rows (MODAL_VISIBLE_ROWS = 11)
+		const visibleRows = MODAL_VISIBLE_ROWS;
 		const candidates = this.cachedCandidates;
 
 		if (candidates.length === 0) {
@@ -1010,10 +1067,10 @@ export class LocationPickerComponent implements Component, Focusable {
 			}
 		}
 
-		// Footer
+		// Line 16..18: Footer
 		lines.push(
 			div(
-				th.fg("dim", "↑↓ nav • Tab complete • Ctrl+W up • Enter select • Esc close"),
+				th.fg("dim", "↑↓ nav • Tab complete • Ctrl+W up • Enter select • Esc back"),
 			),
 		);
 		lines.push(`  ${th.fg("border", `╰${"─".repeat(modalW - 2)}╯`)}`);
@@ -1026,17 +1083,18 @@ export class LocationPickerComponent implements Component, Focusable {
 }
 
 // ============================================================================
-// Dashboard Modal Component (with "+ New Session", "Switch Directory", & Path Completion)
+// Dashboard Modal Component (with in-place Location Picker & Workspace Choice)
 // ============================================================================
 
 export interface DashboardResult {
-	action: "new" | "attach" | "open_location_picker" | "select_dir" | "cancel";
+	action: "new" | "new_in_dir" | "attach" | "open_location_picker" | "select_dir" | "cancel";
 	session?: SessionInfo;
 	selectedDir?: string;
 }
 
 interface IndexedSession {
 	info: SessionInfo;
+	resolvedCwd: string;
 	isCurrentProject: boolean;
 	isActiveSession: boolean;
 	displayTitle: string;
@@ -1055,6 +1113,8 @@ type DashboardRowItem =
 export class DashboardComponent implements Component, Focusable {
 	focused = true;
 	private tui: TUI;
+	private rawSessions: SessionInfo[];
+	private recentDirs: Array<{ path: string; lastActive: number }>;
 	private indexedSessions: IndexedSession[];
 	private rows: DashboardRowItem[] = [];
 	private currentCwd: string;
@@ -1067,6 +1127,9 @@ export class DashboardComponent implements Component, Focusable {
 	private scrollOffset = 0;
 	private theme: Theme;
 	private done: (result: DashboardResult) => void;
+	// Active in-place subview (LocationPicker or SessionChoice) to avoid tearing down custom()
+	private activeSubView: Component | null = null;
+	private activeSubViewName: "dashboard" | "location" | "workspace_sessions" = "dashboard";
 
 	constructor(
 		tui: TUI,
@@ -1075,9 +1138,12 @@ export class DashboardComponent implements Component, Focusable {
 		currentCwd: string,
 		theme: Theme,
 		done: (result: DashboardResult) => void,
+		recentDirs?: Array<{ path: string; lastActive: number }>,
 	) {
 		this.tui = tui;
+		this.rawSessions = sessions;
 		this.currentCwd = path.resolve(currentCwd);
+		this.recentDirs = recentDirs ?? collectRecentDirs(sessions, this.currentCwd);
 		this.branch = getGitBranch(this.currentCwd);
 		this.theme = theme;
 		this.done = done;
@@ -1099,6 +1165,7 @@ export class DashboardComponent implements Component, Focusable {
 
 			return {
 				info: s,
+				resolvedCwd: sessionResolvedCwd,
 				isCurrentProject,
 				isActiveSession,
 				displayTitle: titleText,
@@ -1116,6 +1183,74 @@ export class DashboardComponent implements Component, Focusable {
 
 	public getQuery(): string {
 		return this.query;
+	}
+
+	public getActiveViewName(): "dashboard" | "location" | "workspace_sessions" {
+		return this.activeSubViewName;
+	}
+
+	/** Switch to Location Picker in-place without leaving the modal frame */
+	private enterLocationPickerInPlace(): void {
+		this.activeSubViewName = "location";
+		this.activeSubView = new LocationPickerComponent(
+			this.tui,
+			this.currentCwd,
+			this.recentDirs,
+			this.theme,
+			(res) => {
+				if (res.action === "cancel" || res.action === "open_dashboard") {
+					this.activeSubView = null;
+					this.activeSubViewName = "dashboard";
+					this.tui.requestRender();
+					return;
+				}
+				if (res.action === "select" && res.selectedDir) {
+					this.enterWorkspaceDirInPlace(res.selectedDir, "location");
+				}
+			},
+		);
+		this.tui.requestRender();
+	}
+
+	/** Transition to target workspace directory in-place (showing SessionChoice if sessions exist) */
+	private enterWorkspaceDirInPlace(targetDir: string, returnTo: "dashboard" | "location"): void {
+		const resolved = path.resolve(targetDir);
+		const matchingSessions = this.rawSessions.filter(
+			(s) => s.cwd && path.resolve(s.cwd) === resolved,
+		);
+
+		if (matchingSessions.length === 0) {
+			this.done({ action: "new_in_dir", selectedDir: resolved });
+			return;
+		}
+
+		this.activeSubViewName = "workspace_sessions";
+		this.activeSubView = new SessionChoiceComponent(
+			this.tui,
+			resolved,
+			matchingSessions,
+			this.theme,
+			(choice) => {
+				if (choice.action === "cancel") {
+					if (returnTo === "location") {
+						this.enterLocationPickerInPlace();
+					} else {
+						this.activeSubView = null;
+						this.activeSubViewName = "dashboard";
+						this.tui.requestRender();
+					}
+					return;
+				}
+				if (choice.action === "new") {
+					this.done({ action: "new_in_dir", selectedDir: resolved });
+					return;
+				}
+				if (choice.action === "attach" && choice.session) {
+					this.done({ action: "attach", session: choice.session, selectedDir: resolved });
+				}
+			},
+		);
+		this.tui.requestRender();
 	}
 
 	private rebuildRows(): void {
@@ -1189,14 +1324,20 @@ export class DashboardComponent implements Component, Focusable {
 	handleInput(data: string): void {
 		if (isKeyRelease(data)) return;
 
+		// Delegate to active in-place subview if open
+		if (this.activeSubView && typeof this.activeSubView.handleInput === "function") {
+			this.activeSubView.handleInput(data);
+			return;
+		}
+
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.done({ action: "cancel" });
 			return;
 		}
 
-		// Open location picker right from dashboard (Ctrl+L)
+		// Switch to Location Picker in-place (Ctrl+L) — zero flicker!
 		if (matchesKey(data, "ctrl+l")) {
-			this.done({ action: "open_location_picker" });
+			this.enterLocationPickerInPlace();
 			return;
 		}
 
@@ -1262,10 +1403,9 @@ export class DashboardComponent implements Component, Focusable {
 
 		if (matchesKey(data, "return")) {
 			if (!currentRow) {
-				// If user typed a direct valid directory path with no row match
 				const directTarget = resolveTargetDir(this.query, this.currentCwd);
 				if (directTarget && isDirectorySafe(directTarget)) {
-					this.done({ action: "select_dir", selectedDir: directTarget });
+					this.enterWorkspaceDirInPlace(directTarget, "dashboard");
 				}
 				return;
 			}
@@ -1274,11 +1414,11 @@ export class DashboardComponent implements Component, Focusable {
 				return;
 			}
 			if (currentRow.kind === "open_location_picker") {
-				this.done({ action: "open_location_picker" });
+				this.enterLocationPickerInPlace();
 				return;
 			}
 			if (currentRow.kind === "directory") {
-				this.done({ action: "select_dir", selectedDir: currentRow.fullPath });
+				this.enterWorkspaceDirInPlace(currentRow.fullPath, "dashboard");
 				return;
 			}
 			if (currentRow.kind === "session") {
@@ -1335,7 +1475,7 @@ export class DashboardComponent implements Component, Focusable {
 	}
 
 	private adjustScroll(): void {
-		const visibleRows = 11;
+		const visibleRows = MODAL_VISIBLE_ROWS;
 		if (this.selectedIndex < this.scrollOffset) {
 			this.scrollOffset = this.selectedIndex;
 		} else if (this.selectedIndex >= this.scrollOffset + visibleRows) {
@@ -1344,9 +1484,13 @@ export class DashboardComponent implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		if (this.activeSubView) {
+			return this.activeSubView.render(width);
+		}
+
 		const th = this.theme;
 		const lines: string[] = [];
-		const modalW = Math.max(50, Math.min(width, 86));
+		const modalW = Math.max(MODAL_MIN_WIDTH, Math.min(width, MODAL_MAX_WIDTH));
 
 		const pad = (str: string, len: number) => {
 			const vw = visibleWidth(str);
@@ -1367,17 +1511,17 @@ export class DashboardComponent implements Component, Focusable {
 			return `  ${th.fg("border", `├─`)}${l}${th.fg("border", `${"─".repeat(rem)}┤`)}`;
 		};
 
-		// Header
+		// Line 0..1: Header
 		lines.push("");
 		const title = ` ${th.bold(th.fg("accent", "Pi Agent Dashboard"))} `;
 		const topRem = Math.max(0, modalW - 4 - visibleWidth(title));
 		lines.push(`  ${th.fg("border", `╭─`)}${title}${th.fg("border", `${"─".repeat(topRem)}╮`)}`);
 
-		// CWD Info bar (uses cached branch)
+		// Line 2: CWD Info bar (uses cached branch)
 		const branchStr = this.branch ? th.fg("muted", ` (${this.branch})`) : "";
 		lines.push(row(`${th.fg("dim", "cwd:")} ${th.fg("text", displayPath(this.currentCwd))}${branchStr}`));
 
-		// Scope & Search bar
+		// Line 3: Scope & Search bar
 		const scopePill =
 			this.scope === "all"
 				? `${th.bold(th.fg("accent", `[All (${this.allCount})]`))} ${th.fg("dim", `Cur (${this.cwdCount})`)}`
@@ -1390,10 +1534,11 @@ export class DashboardComponent implements Component, Focusable {
 		const gap = Math.max(2, modalW - 4 - leftW - rightW);
 		lines.push(row(truncateToWidth(`${searchStr}${" ".repeat(gap)}${scopePill}`, modalW - 4)));
 
-		lines.push(div());
+		// Line 4: Divider
+		lines.push(div(th.fg("dim", "Sessions & Workspaces")));
 
-		// Rows Table
-		const visibleRows = 11;
+		// Lines 5..15: Rows Table (MODAL_VISIBLE_ROWS = 11)
+		const visibleRows = MODAL_VISIBLE_ROWS;
 		const totalCount = this.rows.length;
 
 		if (totalCount === 0) {
@@ -1466,7 +1611,7 @@ export class DashboardComponent implements Component, Focusable {
 			}
 		}
 
-		// Footer
+		// Line 16..18: Footer
 		lines.push(
 			div(
 				th.fg("dim", "↑↓ nav • Enter select • Tab complete/scope • Ctrl+L location • Esc close"),
@@ -1478,7 +1623,9 @@ export class DashboardComponent implements Component, Focusable {
 		return lines.map((l) => truncateToWidth(l, width));
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.activeSubView?.invalidate?.();
+	}
 }
 
 // ============================================================================
@@ -1528,10 +1675,7 @@ export async function handleTargetDirectorySelection(
 }
 
 /** Open the interactive Location Picker modal and handle directory change */
-export async function openLocationPicker(
-	ctx: ExtensionContext,
-	returnToDashboardOnCancel = false,
-): Promise<void> {
+export async function openLocationPicker(ctx: ExtensionContext): Promise<void> {
 	if (ctx.mode !== "tui") {
 		ctx.ui.notify("Location picker requires interactive TUI mode", "error");
 		return;
@@ -1541,20 +1685,16 @@ export async function openLocationPicker(
 	const recentDirs = collectRecentDirs(allSessions, ctx.cwd);
 
 	let activeTuiRef: TUI | undefined;
-	const result = await ctx.ui.custom<LocationPickerResult>((tui, theme, _kb, done) => {
+	const result = await ctx.ui.custom<DashboardResult>((tui, theme, _kb, done) => {
 		activeTuiRef = tui;
 		registerDashboardTui(tui);
-		return new LocationPickerComponent(tui, ctx.cwd, recentDirs, theme, done);
+		const dash = new DashboardComponent(tui, allSessions, ctx.sessionManager.getSessionFile(), ctx.cwd, theme, done, recentDirs);
+		// Start directly in location picker view inside the unified frame
+		dash.handleInput("\x0c");
+		return dash;
 	});
 
-	if (result.action === "open_dashboard" || (result.action === "cancel" && returnToDashboardOnCancel)) {
-		await openDashboard(ctx);
-		return;
-	}
-
-	if (result.action === "select" && result.selectedDir) {
-		await handleTargetDirectorySelection(result.selectedDir, ctx, activeTuiRef);
-	}
+	await executeDashboardResult(result, ctx, activeTuiRef);
 }
 
 /** Open the interactive Dashboard modal and handle session attach, new, or location pick */
@@ -1566,16 +1706,30 @@ export async function openDashboard(ctx: ExtensionContext): Promise<void> {
 
 	const allSessions = await SessionManager.listAll().catch(() => []);
 	const currentSessionFile = ctx.sessionManager.getSessionFile();
+	const recentDirs = collectRecentDirs(allSessions, ctx.cwd);
 
 	let activeTuiRef: TUI | undefined;
 	const result = await ctx.ui.custom<DashboardResult>((tui, theme, _kb, done) => {
 		activeTuiRef = tui;
 		registerDashboardTui(tui);
-		return new DashboardComponent(tui, allSessions, currentSessionFile, ctx.cwd, theme, done);
+		return new DashboardComponent(tui, allSessions, currentSessionFile, ctx.cwd, theme, done, recentDirs);
 	});
 
-	if (result.action === "open_location_picker") {
-		await openLocationPicker(ctx, true);
+	await executeDashboardResult(result, ctx, activeTuiRef);
+}
+
+async function executeDashboardResult(
+	result: DashboardResult,
+	ctx: ExtensionContext,
+	activeTuiRef?: TUI,
+): Promise<void> {
+	if (result.action === "new") {
+		await createAndSwitchNewSession(ctx.cwd, ctx, activeTuiRef);
+		return;
+	}
+
+	if (result.action === "new_in_dir" && result.selectedDir) {
+		await createAndSwitchNewSession(result.selectedDir, ctx, activeTuiRef);
 		return;
 	}
 
@@ -1584,21 +1738,18 @@ export async function openDashboard(ctx: ExtensionContext): Promise<void> {
 		return;
 	}
 
-	if (result.action === "new") {
-		await createAndSwitchNewSession(ctx.cwd, ctx, activeTuiRef);
-		return;
-	}
-
 	if (result.action === "attach" && result.session) {
 		const targetSession = result.session;
+		const currentSessionFile = ctx.sessionManager.getSessionFile();
 		if (targetSession.path === currentSessionFile) {
 			ctx.ui.notify("Already in this session", "info");
 			return;
 		}
 
-		const switched = await executeSessionSwitch(targetSession.path, targetSession.cwd, activeTuiRef);
+		const targetCwd = result.selectedDir || targetSession.cwd;
+		const switched = await executeSessionSwitch(targetSession.path, targetCwd, activeTuiRef);
 		if (switched) {
-			ctx.ui.notify(`Switched to session in ${displayPath(targetSession.cwd)}`, "info");
+			ctx.ui.notify(`Switched to session in ${displayPath(targetCwd)}`, "info");
 		} else {
 			ctx.ui.notify(`Failed to switch to session: ${displayPath(targetSession.path)}`, "error");
 		}

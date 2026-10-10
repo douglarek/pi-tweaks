@@ -1228,12 +1228,24 @@ test("pi-tweaks regression suite", async (t) => {
 		assert.equal(shortcuts.has("ctrl+l"), false, "ctrl+l must not be registered globally");
 		assert.ok(shortcuts.has("ctrl+\\"), "must register ctrl+\\ shortcut");
 
-		// Inside DashboardComponent, Ctrl+L (\x0c) triggers open_location_picker
+		// Inside DashboardComponent, Ctrl+L (\x0c) transitions to location picker IN-PLACE (zero flicker, no modal close)
 		let dashAction = null;
 		const mockTui = { requestRender: () => {} };
 		const dash = new DashboardComponent(mockTui, [], undefined, "/tmp", theme, (res) => { dashAction = res; });
+		const dashLines = dash.render(90);
+		assert.equal(dash.getActiveViewName(), "dashboard");
+
 		dash.handleInput("\x0c");
-		assert.equal(dashAction?.action, "open_location_picker");
+		assert.equal(dashAction, null, "must not close the custom modal on Ctrl+L");
+		assert.equal(dash.getActiveViewName(), "location", "must switch to location view in-place");
+		const locLines = dash.render(90);
+		assert.equal(locLines.length, dashLines.length, "frame height must remain identical to prevent viewport reflow flicker");
+		assert.ok(locLines.some((l) => l.includes("Change Working Directory")));
+
+		// Pressing Esc inside location picker returns to dashboard in-place
+		dash.handleInput("\x1b");
+		assert.equal(dashAction, null, "Esc in location subview must return to dashboard, not exit");
+		assert.equal(dash.getActiveViewName(), "dashboard");
 	});
 
 	await t.test("dashboard: SessionChoiceComponent shows + New Session at top and supports selection", () => {
@@ -1336,9 +1348,9 @@ test("pi-tweaks regression suite", async (t) => {
 			// Tab completes the directory inside Dashboard
 			dash.handleInput("\t");
 			assert.ok(dash.getQuery().endsWith("brand-new-repo/"));
-			// Enter switches to that directory
+			// Enter on a directory with no sessions triggers new_in_dir immediately
 			dash.handleInput("\r");
-			assert.equal(dashResult?.action, "select_dir");
+			assert.equal(dashResult?.action, "new_in_dir");
 			assert.equal(dashResult?.selectedDir, newRepo);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
