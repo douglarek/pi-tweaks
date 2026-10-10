@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -42,7 +42,7 @@ const { installQueueDispatch, dispatchEarliestQueuedMessage, collectQueuedMessag
 	await jiti.import(fileURLToPath(new URL("../lib/queue-dispatch.ts", import.meta.url)));
 const { shortenPath, renderCompactFooter, installCompactFooter, resolveFooter, formatTokens, formatCwdForFooter } =
 	await jiti.import(fileURLToPath(new URL("../lib/compact-footer.ts", import.meta.url)));
-const { displayPath, expandTilde, cleanPathArg, resolveTargetDir, formatRelativeTime, collectRecentDirs, getSubdirectories, installDashboardCommands, SessionChoiceComponent } =
+const { displayPath, expandTilde, cleanPathArg, resolveTargetDir, formatRelativeTime, collectRecentDirs, getSubdirectories, installDashboardCommands, SessionChoiceComponent, LocationPickerComponent, DashboardComponent, extractPrintableInput, deletePathSegmentBackward } =
 	await jiti.import(fileURLToPath(new URL("../lib/dashboard.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
@@ -1249,5 +1249,92 @@ test("pi-tweaks regression suite", async (t) => {
 		comp.handleInput("\r");
 		assert.equal(chosen?.action, "attach");
 		assert.equal(chosen?.session?.path, "/tmp/s1.jsonl");
+	});
+
+	await t.test("dashboard: Kitty CSI-u printable input, bracketed paste, and path segment deletion", () => {
+		// Kitty CSI-u plain 'a' (\x1b[97u), '/' (\x1b[47u), shifted '~' (\x1b[96:126;2u)
+		assert.equal(extractPrintableInput("\x1b[97u"), "a");
+		assert.equal(extractPrintableInput("\x1b[47u"), "/");
+		assert.equal(extractPrintableInput("\x1b[96:126;2u"), "~");
+		// Key release must be ignored
+		assert.equal(extractPrintableInput("\x1b[97;1:3u"), undefined);
+		// Bracketed paste
+		assert.equal(extractPrintableInput("\x1b[200~/Users/admin/new-dir\x1b[201~"), "/Users/admin/new-dir");
+		// Control sequences like Up arrow must be ignored
+		assert.equal(extractPrintableInput("\x1b[A"), undefined);
+
+		// Ctrl+W path segment backward deletion
+		assert.equal(deletePathSegmentBackward("~/work/ai-works/grok-build/"), "~/work/ai-works/");
+		assert.equal(deletePathSegmentBackward("~/work/ai-works/grok"), "~/work/ai-works/");
+		assert.equal(deletePathSegmentBackward("~/work/"), "~/");
+		assert.equal(deletePathSegmentBackward("~/"), "");
+	});
+
+	await t.test("dashboard: LocationPickerComponent and DashboardComponent support typing and Tab-completing new directories", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-dash-complete-"));
+		const currentRepo = join(root, "current-repo");
+		const newRepo = join(root, "brand-new-repo");
+		const nestedSub = join(newRepo, "packages");
+		mkdirSync(currentRepo, { recursive: true });
+		mkdirSync(nestedSub, { recursive: true });
+
+		try {
+			const mockTui = { requestRender: () => {} };
+			let picked = null;
+			const lp = new LocationPickerComponent(
+				mockTui,
+				currentRepo,
+				[{ path: currentRepo, lastActive: Date.now() }],
+				theme,
+				(res) => { picked = res; },
+			);
+
+			// Sibling directory "brand-new-repo" is discovered automatically even before typing
+			assert.ok(
+				lp.getCandidates().some((c) => c.fullPath === realpathSync(newRepo) || c.fullPath === newRepo),
+				"sibling workspace directory should be discovered automatically",
+			);
+
+			// Type "brand" using Kitty CSI-u sequences (\x1b[98u = 'b', \x1b[114u = 'r', etc.)
+			for (const ch of "brand") {
+				lp.handleInput(`\x1b[${ch.charCodeAt(0)}u`);
+			}
+			assert.equal(lp.getQuery(), "brand");
+			assert.equal(lp.getCandidates().length, 1);
+			assert.ok(lp.getCandidates()[0].label.startsWith("brand-new-repo"));
+
+			// Press Tab to autocomplete -> query becomes "<newRepo>/"
+			lp.handleInput("\t");
+			assert.ok(lp.getQuery().endsWith("brand-new-repo/"), `expected query ending with brand-new-repo/, got ${lp.getQuery()}`);
+			// Index 0 is self-target (. (brand-new-repo)), Index 1 is child "packages/"
+			assert.equal(lp.getCandidates()[0].isSelfTarget, true);
+			assert.equal(lp.getCandidates()[1].label, "packages/");
+
+			// Pressing Enter immediately after Tab selects brand-new-repo itself (not packages/)
+			lp.handleInput("\r");
+			assert.equal(picked?.action, "select");
+			assert.equal(picked?.selectedDir, newRepo);
+
+			// Pressing Tab again drills into child directory "packages/"
+			lp.handleInput("\t");
+			assert.ok(lp.getQuery().endsWith("brand-new-repo/packages/"));
+
+			// DashboardComponent also supports typing and Tab-completing a new directory directly
+			let dashResult = null;
+			const dash = new DashboardComponent(mockTui, [], undefined, currentRepo, theme, (res) => { dashResult = res; });
+			for (const ch of "brand") {
+				dash.handleInput(`\x1b[${ch.charCodeAt(0)}u`);
+			}
+			assert.equal(dash.getQuery(), "brand");
+			// Tab completes the directory inside Dashboard
+			dash.handleInput("\t");
+			assert.ok(dash.getQuery().endsWith("brand-new-repo/"));
+			// Enter switches to that directory
+			dash.handleInput("\r");
+			assert.equal(dashResult?.action, "select_dir");
+			assert.equal(dashResult?.selectedDir, newRepo);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

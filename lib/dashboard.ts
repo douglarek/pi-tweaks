@@ -3,18 +3,18 @@
  *
  * Modeled after grok-build's Dashboard and Ctrl+L Location Picker:
  * - /dashboard (or /db, Ctrl+\): Interactive dashboard showing historical sessions across projects,
- *   with "+ New Session" at the top, live fuzzy filtering, project scope toggling, and instant session attachment.
+ *   with "+ New Session" and "Switch Working Directory" at the top, live fuzzy filtering,
+ *   inline directory path completion, project scope toggling, and instant session attachment.
  * - /cd [path]: Change working directory for Pi. Without arguments, opens the Location Picker modal.
+ *   Supports Tab argument completion directly in the main editor.
  * - Ctrl+L: Opens the Location Picker directly from the editor or within the Dashboard.
  *
  * UX enhancements:
+ * - Full Kitty keyboard protocol (CSI-u) printable decoding, bracketed paste, and Ctrl+W path segment deletion.
+ * - Live filesystem directory completion with Tab in both Location Picker and Dashboard.
+ * - Automatically discovers sibling workspace directories in addition to session history.
  * - When switching workspace, shows target directory's sessions with "+ New Session" at the very top.
- * - Users can hit Enter immediately to start fresh, or press Down to select recent conversations.
- * - Instant session and directory switching upon Enter (no manual /cd typing in the input box).
- * - Multi-strategy switch execution (command context, active session, resolved component tree).
- * - Robust path argument cleaning (handles surrounding quotes cleanly).
- * - Zero synchronous disk I/O in the render/navigation loop.
- * - Instant 60fps keyboard navigation with immediate TUI render scheduling.
+ * - Instant session and directory switching upon Enter.
  */
 
 import * as fs from "node:fs";
@@ -31,7 +31,9 @@ import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-codi
 import {
 	CURSOR_MARKER,
 	type Component,
+	decodeKittyPrintable,
 	type Focusable,
+	isKeyRelease,
 	matchesKey,
 	truncateToWidth,
 	visibleWidth,
@@ -61,6 +63,62 @@ export function registerDashboardEditor(editor: any): void {
 // Helper Utilities
 // ============================================================================
 
+/** Safe directory existence check (resolves symlinks via statSync) */
+export function isDirectorySafe(p: string): boolean {
+	try {
+		return fs.existsSync(p) && fs.statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Decode printable text input from raw terminal data.
+ * Supports Kitty CSI-u sequences (\x1b[97u), bracketed paste (\x1b[200~...\x1b[201~),
+ * and standard ASCII / UTF-8 characters while ignoring key-release events.
+ */
+export function extractPrintableInput(data: string): string | undefined {
+	if (!data || isKeyRelease(data)) return undefined;
+
+	// Handle bracketed paste mode
+	if (data.includes("\x1b[200~")) {
+		const cleaned = data
+			.replace(/\x1b\[200~/g, "")
+			.replace(/\x1b\[201~/g, "")
+			.replace(/[\r\n\t]/g, "");
+		return cleaned.length > 0 ? cleaned : undefined;
+	}
+
+	// Handle Kitty CSI-u printable key events (e.g. \x1b[97u -> 'a', \x1b[47u -> '/')
+	const kitty = decodeKittyPrintable(data);
+	if (kitty !== undefined) {
+		return kitty;
+	}
+
+	// Regular printable characters (ASCII or multi-byte UTF-8 / CJK),
+	// rejecting control characters (C0: 0x00-0x1F, DEL: 0x7F, C1: 0x80-0x9F)
+	const hasControlChars = [...data].some((ch) => {
+		const code = ch.charCodeAt(0);
+		return code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
+	});
+	if (!hasControlChars && data.length > 0) {
+		return data;
+	}
+
+	return undefined;
+}
+
+/** Delete one path segment or word backward (Ctrl+W / Alt+Backspace behavior) */
+export function deletePathSegmentBackward(query: string): string {
+	if (!query) return "";
+	const trimmed = query.endsWith("/") && query.length > 1 ? query.slice(0, -1) : query;
+	const lastSlash = trimmed.lastIndexOf("/");
+	const lastSpace = trimmed.lastIndexOf(" ");
+	const cutIndex = Math.max(lastSlash, lastSpace);
+	if (cutIndex === -1) return "";
+	return trimmed.slice(0, cutIndex + 1);
+}
+
 /** Clean quotes and whitespace from path arguments */
 export function cleanPathArg(raw: string | undefined): string {
 	let p = (raw ?? "").trim();
@@ -87,6 +145,9 @@ export function expandTilde(p: string): string {
 	if (cleaned.startsWith(`~${path.sep}`) || cleaned.startsWith("~/")) {
 		return path.join(os.homedir(), cleaned.slice(2));
 	}
+	if (cleaned.startsWith("~") && !cleaned.includes("/") && !cleaned.includes("\\")) {
+		return path.join(os.homedir(), cleaned.slice(1));
+	}
 	return cleaned;
 }
 
@@ -95,7 +156,19 @@ export function resolveTargetDir(rawPath: string, baseCwd: string): string {
 	const cleaned = cleanPathArg(rawPath);
 	if (!cleaned) return "";
 	const expanded = expandTilde(cleaned);
-	return path.isAbsolute(expanded) ? expanded : path.resolve(baseCwd, expanded);
+	return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(baseCwd, expanded);
+}
+
+/** Whether a query string should trigger filesystem path completion mode */
+export function isPathLikeQuery(rawQuery: string): boolean {
+	const q = cleanPathArg(rawQuery);
+	return (
+		q.startsWith("/") ||
+		q.startsWith("~") ||
+		q.startsWith(".") ||
+		q.includes("/") ||
+		(process.platform === "win32" && q.includes("\\"))
+	);
 }
 
 /** Human-friendly relative time (e.g. "5m ago", "2h ago", "3d ago") */
@@ -154,15 +227,12 @@ export function collectRecentDirs(sessions: SessionInfo[], currentCwd: string): 
 
 	for (const s of sessions) {
 		if (!s.cwd) continue;
-		try {
-			if (!fs.existsSync(s.cwd)) continue;
-		} catch {
-			continue;
-		}
+		if (!isDirectorySafe(s.cwd)) continue;
+		const resolved = path.resolve(s.cwd);
 		const ts = new Date(s.modified).getTime();
-		const prev = latestByDir.get(s.cwd) ?? 0;
+		const prev = latestByDir.get(resolved) ?? 0;
 		if (ts > prev) {
-			latestByDir.set(s.cwd, ts);
+			latestByDir.set(resolved, ts);
 		}
 	}
 
@@ -179,33 +249,28 @@ export function collectRecentDirs(sessions: SessionInfo[], currentCwd: string): 
 	return [...result, ...others];
 }
 
-/** List subdirectories for path completion mode */
-export function getSubdirectories(query: string, baseCwd: string): Array<{ name: string; fullPath: string }> {
-	const cleaned = cleanPathArg(query);
-	const expanded = expandTilde(cleaned);
-	const endsWithSep = cleaned.endsWith("/") || (process.platform === "win32" && cleaned.endsWith("\\"));
-
-	let parentDir: string;
-	let partial: string;
-
-	if (endsWithSep) {
-		parentDir = path.isAbsolute(expanded) ? expanded : path.resolve(baseCwd, expanded);
-		partial = "";
-	} else {
-		const target = path.isAbsolute(expanded) ? expanded : path.resolve(baseCwd, expanded);
-		parentDir = path.dirname(target);
-		partial = path.basename(target).toLowerCase();
-	}
-
-	if (!fs.existsSync(parentDir)) return [];
+/** Read subdirectories inside parentDir matching optional partial name */
+function listDirsInParent(parentDir: string, partial: string): Array<{ name: string; fullPath: string }> {
+	if (!isDirectorySafe(parentDir)) return [];
 	try {
-		const stat = fs.statSync(parentDir);
-		if (!stat.isDirectory()) return [];
+		const wantHidden = partial.startsWith(".");
 		const entries = fs.readdirSync(parentDir, { withFileTypes: true });
 		return entries
-			.filter((e) => e.isDirectory() && (!e.name.startsWith(".") || partial.startsWith(".")))
-			.filter((e) => !partial || e.name.toLowerCase().startsWith(partial))
-			.sort((a, b) => a.name.localeCompare(b.name))
+			.filter((e) => {
+				if (e.name.startsWith(".") && !wantHidden) return false;
+				if (e.isDirectory()) return true;
+				if (e.isSymbolicLink()) return isDirectorySafe(path.join(parentDir, e.name));
+				return false;
+			})
+			.filter((e) => !partial || e.name.toLowerCase().includes(partial))
+			.sort((a, b) => {
+				if (partial) {
+					const aStarts = a.name.toLowerCase().startsWith(partial);
+					const bStarts = b.name.toLowerCase().startsWith(partial);
+					if (aStarts !== bStarts) return aStarts ? -1 : 1;
+				}
+				return a.name.localeCompare(b.name);
+			})
 			.map((e) => ({
 				name: e.name,
 				fullPath: path.join(parentDir, e.name),
@@ -213,6 +278,86 @@ export function getSubdirectories(query: string, baseCwd: string): Array<{ name:
 	} catch {
 		return [];
 	}
+}
+
+/** List subdirectories for path completion mode */
+export function getSubdirectories(query: string, baseCwd: string): Array<{ name: string; fullPath: string }> {
+	const cleaned = cleanPathArg(query);
+	const resolvedBase = path.resolve(baseCwd);
+
+	let parentDir: string;
+	let partial: string;
+
+	if (!cleaned || cleaned === ".") {
+		parentDir = resolvedBase;
+		partial = "";
+	} else if (cleaned === "..") {
+		parentDir = path.dirname(resolvedBase);
+		partial = "";
+	} else if (cleaned === "~") {
+		parentDir = os.homedir();
+		partial = "";
+	} else if (cleaned.startsWith("~") && !cleaned.includes("/") && !cleaned.includes("\\")) {
+		parentDir = os.homedir();
+		partial = cleaned.slice(1).toLowerCase();
+	} else {
+		const expanded = expandTilde(cleaned);
+		const endsWithSep = cleaned.endsWith("/") || (process.platform === "win32" && cleaned.endsWith("\\"));
+		const target = path.isAbsolute(expanded) ? expanded : path.resolve(resolvedBase, expanded);
+
+		if (endsWithSep) {
+			parentDir = target;
+			partial = "";
+		} else {
+			parentDir = path.dirname(target);
+			partial = path.basename(target).toLowerCase();
+		}
+	}
+
+	return listDirsInParent(parentDir, partial);
+}
+
+/**
+ * Discover nearby directories (sibling projects in parent dir, subdirs of cwd, and home subdirs)
+ * so users can find and complete new folders even without typing leading '/' or '~'.
+ */
+export function discoverNearbyDirectories(
+	query: string,
+	baseCwd: string,
+	excludePaths: Set<string>,
+): Array<{ name: string; fullPath: string; source: string }> {
+	const resolvedBase = path.resolve(baseCwd);
+	const parentWorkspace = path.dirname(resolvedBase);
+	const home = os.homedir();
+	const partial = cleanPathArg(query).toLowerCase();
+
+	const results: Array<{ name: string; fullPath: string; source: string }> = [];
+	const seen = new Set<string>(excludePaths);
+
+	const addFrom = (dir: string, sourceLabel: string, limit: number) => {
+		const subdirs = listDirsInParent(dir, partial);
+		let count = 0;
+		for (const d of subdirs) {
+			const norm = path.resolve(d.fullPath);
+			if (seen.has(norm)) continue;
+			seen.add(norm);
+			results.push({ name: d.name, fullPath: norm, source: sourceLabel });
+			if (++count >= limit) break;
+		}
+	};
+
+	// 1. Sibling directories in the parent workspace (e.g. ~/work/ai-works/*)
+	if (parentWorkspace && parentWorkspace !== resolvedBase) {
+		addFrom(parentWorkspace, "workspace", 30);
+	}
+	// 2. Immediate subdirectories of current working directory
+	addFrom(resolvedBase, "subdir", 20);
+	// 3. When user types a query, also search home directory
+	if (partial && home !== resolvedBase && home !== parentWorkspace) {
+		addFrom(home, "home", 15);
+	}
+
+	return results;
 }
 
 // ============================================================================
@@ -366,6 +511,8 @@ export class SessionChoiceComponent implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
+		if (isKeyRelease(data)) return;
+
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.done({ action: "cancel" });
 			return;
@@ -528,6 +675,7 @@ export interface CandidateItem {
 	detail: string;
 	fullPath: string;
 	isCurrent: boolean;
+	isSelfTarget?: boolean;
 }
 
 export class LocationPickerComponent implements Component, Focusable {
@@ -540,6 +688,7 @@ export class LocationPickerComponent implements Component, Focusable {
 	private baseCwd: string;
 	private branch: string | null;
 	private recentCandidates: CandidateItem[];
+	private recentPathSet: Set<string>;
 	private cachedCandidates: CandidateItem[];
 	private theme: Theme;
 	private done: (result: LocationPickerResult) => void;
@@ -557,51 +706,95 @@ export class LocationPickerComponent implements Component, Focusable {
 		this.theme = theme;
 		this.done = done;
 
+		this.recentPathSet = new Set<string>();
 		// Pre-compute recent items once
 		this.recentCandidates = recentDirs.map((d) => {
-			const isCurrent = d.path === this.baseCwd;
-			const name = path.basename(d.path) || d.path;
-			const timeStr = isCurrent ? "(current)" : formatRelativeTime(d.lastActive);
+			const norm = path.resolve(d.path);
+			this.recentPathSet.add(norm);
+			const isCurrent = norm === this.baseCwd;
+			const name = path.basename(norm) || norm;
+			const timeStr = isCurrent ? "current" : formatRelativeTime(d.lastActive);
 			return {
 				label: name,
-				detail: `${displayPath(d.path)}  ${timeStr ? `(${timeStr})` : ""}`,
-				fullPath: d.path,
+				detail: `${displayPath(norm)}  ${timeStr ? `(${timeStr})` : ""}`,
+				fullPath: norm,
 				isCurrent,
 			};
 		});
 
-		this.cachedCandidates = this.recentCandidates;
+		this.cachedCandidates = [];
+		this.updateCandidates();
+	}
+
+	public getQuery(): string {
+		return this.query;
+	}
+
+	public getCandidates(): CandidateItem[] {
+		return this.cachedCandidates;
 	}
 
 	private isPathMode(): boolean {
-		const q = cleanPathArg(this.query);
-		return q.startsWith("/") || q.startsWith("~") || q.startsWith(".") || q.includes("/");
+		return isPathLikeQuery(this.query);
 	}
 
 	private updateCandidates(): void {
+		const cleaned = cleanPathArg(this.query);
+
 		if (this.isPathMode()) {
-			const subdirs = getSubdirectories(this.query.trim(), this.baseCwd);
-			this.cachedCandidates = subdirs.map((d) => ({
-				label: d.name,
-				detail: displayPath(d.fullPath),
-				fullPath: d.fullPath,
-				isCurrent: d.fullPath === this.baseCwd,
-			}));
+			const subdirs = getSubdirectories(cleaned, this.baseCwd);
+			const items: CandidateItem[] = [];
+
+			// When query ends with '/' and points to a valid directory, place the directory itself
+			// at index 0 so pressing Enter after Tab-completing opens that directory directly.
+			const endsWithSep = cleaned.endsWith("/") || (process.platform === "win32" && cleaned.endsWith("\\"));
+			const resolvedExact = resolveTargetDir(cleaned, this.baseCwd);
+			if ((endsWithSep || cleaned === "~" || cleaned === "." || cleaned === "..") && isDirectorySafe(resolvedExact)) {
+				const dirName = path.basename(resolvedExact) || resolvedExact;
+				items.push({
+					label: `. (${dirName})`,
+					detail: `${displayPath(resolvedExact)}  [Enter: open this directory]`,
+					fullPath: resolvedExact,
+					isCurrent: resolvedExact === this.baseCwd,
+					isSelfTarget: true,
+				});
+			}
+
+			for (const d of subdirs) {
+				items.push({
+					label: `${d.name}/`,
+					detail: displayPath(d.fullPath),
+					fullPath: d.fullPath,
+					isCurrent: d.fullPath === this.baseCwd,
+				});
+			}
+
+			this.cachedCandidates = items;
 			return;
 		}
 
-		const q = cleanPathArg(this.query).toLowerCase();
-		if (!q) {
-			this.cachedCandidates = this.recentCandidates;
-			return;
-		}
+		const q = cleaned.toLowerCase();
+		const matchedRecents = !q
+			? this.recentCandidates
+			: this.recentCandidates.filter(
+					(c) => c.label.toLowerCase().includes(q) || c.detail.toLowerCase().includes(q),
+				);
 
-		this.cachedCandidates = this.recentCandidates.filter((c) => {
-			return c.label.toLowerCase().includes(q) || c.detail.toLowerCase().includes(q);
-		});
+		// Also discover nearby workspace / child / home directories so new folders not in history
+		// are immediately visible and completable!
+		const nearby = discoverNearbyDirectories(cleaned, this.baseCwd, this.recentPathSet).map((d) => ({
+			label: `${d.name}/`,
+			detail: `${displayPath(d.fullPath)}  (${d.source})`,
+			fullPath: d.fullPath,
+			isCurrent: false,
+		}));
+
+		this.cachedCandidates = [...matchedRecents, ...nearby];
 	}
 
 	handleInput(data: string): void {
+		if (isKeyRelease(data)) return;
+
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.done({ action: "cancel" });
 			return;
@@ -645,9 +838,13 @@ export class LocationPickerComponent implements Component, Focusable {
 			return;
 		}
 
-		// Tab completion
+		// Tab completion: complete selected directory path with trailing '/' to browse subdirs
 		if (matchesKey(data, "tab")) {
-			const selected = this.cachedCandidates[this.selectedIndex];
+			let selected = this.cachedCandidates[this.selectedIndex];
+			// If index 0 is the self-target (`. (dir)`) and there is a child directory, complete the first child
+			if (selected?.isSelfTarget && this.cachedCandidates.length > 1) {
+				selected = this.cachedCandidates[1];
+			}
 			if (selected) {
 				let completed = displayPath(selected.fullPath);
 				if (!completed.endsWith("/")) completed += "/";
@@ -667,12 +864,38 @@ export class LocationPickerComponent implements Component, Focusable {
 			const target = selected ? selected.fullPath : resolveTargetDir(this.query, this.baseCwd);
 			if (!target) return;
 
-			if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
-				this.error = `Not a directory: ${cleanPathArg(this.query)}`;
+			if (!isDirectorySafe(target)) {
+				this.error = `Not a directory: ${cleanPathArg(this.query) || target}`;
 				this.tui.requestRender();
 				return;
 			}
 			this.done({ action: "select", selectedDir: path.resolve(target) });
+			return;
+		}
+
+		// Ctrl+U: clear entire query line
+		if (matchesKey(data, "ctrl+u")) {
+			if (this.query.length > 0) {
+				this.query = "";
+				this.selectedIndex = 0;
+				this.scrollOffset = 0;
+				this.error = null;
+				this.updateCandidates();
+				this.tui.requestRender();
+			}
+			return;
+		}
+
+		// Ctrl+W or Alt+Backspace: delete last path segment backward
+		if (matchesKey(data, "ctrl+w") || matchesKey(data, "alt+backspace")) {
+			if (this.query.length > 0) {
+				this.query = deletePathSegmentBackward(this.query);
+				this.selectedIndex = 0;
+				this.scrollOffset = 0;
+				this.error = null;
+				this.updateCandidates();
+				this.tui.requestRender();
+			}
 			return;
 		}
 
@@ -689,9 +912,10 @@ export class LocationPickerComponent implements Component, Focusable {
 			return;
 		}
 
-		// Printable character input
-		if (data.length === 1 && data.charCodeAt(0) >= 32) {
-			this.query += data;
+		// Printable character input (supports Kitty CSI-u, paste, and UTF-8)
+		const printable = extractPrintableInput(data);
+		if (printable !== undefined) {
+			this.query += printable;
 			this.selectedIndex = 0;
 			this.scrollOffset = 0;
 			this.error = null;
@@ -743,16 +967,17 @@ export class LocationPickerComponent implements Component, Focusable {
 		const branchStr = this.branch ? th.fg("muted", ` (${this.branch})`) : "";
 		lines.push(row(`${th.fg("dim", "current:")} ${th.fg("text", displayPath(this.baseCwd))}${branchStr}`));
 
-		// Path input field
+		// Path input field with placeholder hint when empty
 		const inputPrefix = th.fg("accent", "path: ");
-		const queryDisplay = this.query + CURSOR_MARKER;
-		lines.push(row(`${inputPrefix}${th.fg("text", queryDisplay)}`));
+		const placeholder = !this.query ? th.fg("dim", "type path (~/, ../, /) or name, Tab to complete") : "";
+		const queryDisplay = `${th.fg("text", this.query)}${CURSOR_MARKER}${placeholder}`;
+		lines.push(row(truncateToWidth(`${inputPrefix}${queryDisplay}`, modalW - 4)));
 
 		// Error line or divider
 		if (this.error) {
 			lines.push(div(th.fg("error", `✗ ${this.error}`)));
 		} else {
-			const modeLabel = this.isPathMode() ? "Path Completion" : "Recent Projects";
+			const modeLabel = this.isPathMode() ? "Path Completion (Tab: drill down • Ctrl+W: up)" : "Recent & Workspace Directories (Tab: complete)";
 			lines.push(div(th.fg("dim", modeLabel)));
 		}
 
@@ -761,7 +986,7 @@ export class LocationPickerComponent implements Component, Focusable {
 		const candidates = this.cachedCandidates;
 
 		if (candidates.length === 0) {
-			lines.push(row(th.fg("dim", "  (no matching directories)")));
+			lines.push(row(th.fg("dim", "  (no matching directories — press Enter to try typed path)")));
 			for (let i = 1; i < visibleRows; i++) {
 				lines.push(row(""));
 			}
@@ -776,7 +1001,8 @@ export class LocationPickerComponent implements Component, Focusable {
 				}
 				const isSel = itemIndex === this.selectedIndex;
 				const pointer = isSel ? th.fg("accent", "❯ ") : "  ";
-				const label = isSel ? th.bold(th.fg("accent", c.label)) : th.fg("text", c.label);
+				const labelColor = c.isSelfTarget ? "success" : "text";
+				const label = isSel ? th.bold(th.fg("accent", c.label)) : th.fg(labelColor, c.label);
 				const detail = isSel ? th.fg("text", c.detail) : th.fg("muted", c.detail);
 
 				const content = `${pointer}${label}  ${detail}`;
@@ -787,7 +1013,7 @@ export class LocationPickerComponent implements Component, Focusable {
 		// Footer
 		lines.push(
 			div(
-				th.fg("dim", "↑↓ nav  •  Tab complete  •  Enter select  •  Ctrl+\\ dashboard  •  Esc close"),
+				th.fg("dim", "↑↓ nav • Tab complete • Ctrl+W up • Enter select • Esc close"),
 			),
 		);
 		lines.push(`  ${th.fg("border", `╰${"─".repeat(modalW - 2)}╯`)}`);
@@ -800,12 +1026,13 @@ export class LocationPickerComponent implements Component, Focusable {
 }
 
 // ============================================================================
-// Dashboard Modal Component (with "+ New Session" at the top)
+// Dashboard Modal Component (with "+ New Session", "Switch Directory", & Path Completion)
 // ============================================================================
 
 export interface DashboardResult {
-	action: "new" | "attach" | "open_location_picker" | "cancel";
+	action: "new" | "attach" | "open_location_picker" | "select_dir" | "cancel";
 	session?: SessionInfo;
+	selectedDir?: string;
 }
 
 interface IndexedSession {
@@ -819,18 +1046,24 @@ interface IndexedSession {
 	searchKey: string;
 }
 
+type DashboardRowItem =
+	| { kind: "new_session" }
+	| { kind: "open_location_picker" }
+	| { kind: "directory"; label: string; detail: string; fullPath: string; isSelfTarget?: boolean }
+	| { kind: "session"; session: IndexedSession };
+
 export class DashboardComponent implements Component, Focusable {
 	focused = true;
 	private tui: TUI;
 	private indexedSessions: IndexedSession[];
-	private filteredSessions: IndexedSession[];
+	private rows: DashboardRowItem[] = [];
 	private currentCwd: string;
 	private branch: string | null;
 	private allCount: number;
 	private cwdCount: number;
 	private query = "";
 	private scope: "all" | "cwd" = "all";
-	private selectedIndex = 0; // 0 is "+ New Session" when query is empty, else session index
+	private selectedIndex = 0;
 	private scrollOffset = 0;
 	private theme: Theme;
 	private done: (result: DashboardResult) => void;
@@ -878,27 +1111,84 @@ export class DashboardComponent implements Component, Focusable {
 
 		this.allCount = this.indexedSessions.length;
 		this.cwdCount = this.indexedSessions.filter((s) => s.isCurrentProject).length;
-		this.filteredSessions = this.indexedSessions;
+		this.rebuildRows();
 	}
 
-	private hasNewItem(): boolean {
-		return cleanPathArg(this.query) === "";
+	public getQuery(): string {
+		return this.query;
 	}
 
-	private getTotalCount(): number {
-		return (this.hasNewItem() ? 1 : 0) + this.filteredSessions.length;
-	}
+	private rebuildRows(): void {
+		const cleaned = cleanPathArg(this.query);
+		const q = cleaned.toLowerCase();
+		const nextRows: DashboardRowItem[] = [];
 
-	private updateFilteredSessions(): void {
-		const q = cleanPathArg(this.query).toLowerCase();
-		this.filteredSessions = this.indexedSessions.filter((s) => {
-			if (this.scope === "cwd" && !s.isCurrentProject) return false;
-			if (!q) return true;
-			return s.searchKey.includes(q);
-		});
+		if (!cleaned) {
+			nextRows.push({ kind: "new_session" });
+			nextRows.push({ kind: "open_location_picker" });
+			for (const s of this.indexedSessions) {
+				if (this.scope === "cwd" && !s.isCurrentProject) continue;
+				nextRows.push({ kind: "session", session: s });
+			}
+			this.rows = nextRows;
+			return;
+		}
+
+		// If the user types a path (/, ~, ., or contains /), provide live directory completion right inside Dashboard!
+		if (isPathLikeQuery(cleaned)) {
+			const endsWithSep = cleaned.endsWith("/") || (process.platform === "win32" && cleaned.endsWith("\\"));
+			const resolvedExact = resolveTargetDir(cleaned, this.currentCwd);
+			if ((endsWithSep || cleaned === "~" || cleaned === "." || cleaned === "..") && isDirectorySafe(resolvedExact)) {
+				const dirName = path.basename(resolvedExact) || resolvedExact;
+				nextRows.push({
+					kind: "directory",
+					label: `. (${dirName})`,
+					detail: `${displayPath(resolvedExact)}  [Enter: switch to this directory]`,
+					fullPath: resolvedExact,
+					isSelfTarget: true,
+				});
+			}
+
+			const subdirs = getSubdirectories(cleaned, this.currentCwd);
+			for (const d of subdirs) {
+				nextRows.push({
+					kind: "directory",
+					label: `${d.name}/`,
+					detail: `${displayPath(d.fullPath)}  [Tab: complete • Enter: switch]`,
+					fullPath: d.fullPath,
+				});
+			}
+		}
+
+		// Matching sessions
+		const matchedSessionDirs = new Set<string>([this.currentCwd]);
+		for (const s of this.indexedSessions) {
+			if (this.scope === "cwd" && !s.isCurrentProject) continue;
+			if (s.searchKey.includes(q)) {
+				nextRows.push({ kind: "session", session: s });
+				if (s.info.cwd) matchedSessionDirs.add(path.resolve(s.info.cwd));
+			}
+		}
+
+		// Also discover matching workspace/nearby directories when typing a plain name (e.g. "zcode")
+		if (!isPathLikeQuery(cleaned)) {
+			const nearby = discoverNearbyDirectories(cleaned, this.currentCwd, matchedSessionDirs);
+			for (const d of nearby) {
+				nextRows.push({
+					kind: "directory",
+					label: `${d.name}/`,
+					detail: `${displayPath(d.fullPath)}  (${d.source} • Tab: complete • Enter: switch)`,
+					fullPath: d.fullPath,
+				});
+			}
+		}
+
+		this.rows = nextRows;
 	}
 
 	handleInput(data: string): void {
+		if (isKeyRelease(data)) return;
+
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.done({ action: "cancel" });
 			return;
@@ -910,17 +1200,33 @@ export class DashboardComponent implements Component, Focusable {
 			return;
 		}
 
-		// Toggle scope between All Projects and Current Project
+		const totalCount = this.rows.length;
+		const currentRow = this.rows[this.selectedIndex];
+
+		// Tab: if a directory row is selected (or in path mode), autocomplete the directory path!
+		// Otherwise toggle scope between All Projects and Current Project.
 		if (matchesKey(data, "tab")) {
+			if (currentRow?.kind === "directory") {
+				let targetRow = currentRow;
+				if (targetRow.isSelfTarget && this.rows[1]?.kind === "directory") {
+					targetRow = this.rows[1];
+				}
+				let completed = displayPath(targetRow.fullPath);
+				if (!completed.endsWith("/")) completed += "/";
+				this.query = completed;
+				this.selectedIndex = 0;
+				this.scrollOffset = 0;
+				this.rebuildRows();
+				this.tui.requestRender();
+				return;
+			}
 			this.scope = this.scope === "all" ? "cwd" : "all";
 			this.selectedIndex = 0;
 			this.scrollOffset = 0;
-			this.updateFilteredSessions();
+			this.rebuildRows();
 			this.tui.requestRender();
 			return;
 		}
-
-		const totalCount = this.getTotalCount();
 
 		if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
 			if (this.selectedIndex > 0) {
@@ -955,14 +1261,53 @@ export class DashboardComponent implements Component, Focusable {
 		}
 
 		if (matchesKey(data, "return")) {
-			if (this.hasNewItem() && this.selectedIndex === 0) {
+			if (!currentRow) {
+				// If user typed a direct valid directory path with no row match
+				const directTarget = resolveTargetDir(this.query, this.currentCwd);
+				if (directTarget && isDirectorySafe(directTarget)) {
+					this.done({ action: "select_dir", selectedDir: directTarget });
+				}
+				return;
+			}
+			if (currentRow.kind === "new_session") {
 				this.done({ action: "new" });
 				return;
 			}
-			const sessionIdx = this.hasNewItem() ? this.selectedIndex - 1 : this.selectedIndex;
-			const selected = this.filteredSessions[sessionIdx];
-			if (selected) {
-				this.done({ action: "attach", session: selected.info });
+			if (currentRow.kind === "open_location_picker") {
+				this.done({ action: "open_location_picker" });
+				return;
+			}
+			if (currentRow.kind === "directory") {
+				this.done({ action: "select_dir", selectedDir: currentRow.fullPath });
+				return;
+			}
+			if (currentRow.kind === "session") {
+				this.done({ action: "attach", session: currentRow.session.info });
+				return;
+			}
+			return;
+		}
+
+		// Ctrl+U: clear query
+		if (matchesKey(data, "ctrl+u")) {
+			if (this.query.length > 0) {
+				this.query = "";
+				this.selectedIndex = 0;
+				this.scrollOffset = 0;
+				this.rebuildRows();
+				this.tui.requestRender();
+			}
+			return;
+		}
+
+		// Ctrl+W / Alt+Backspace: delete path segment or word backward
+		if (matchesKey(data, "ctrl+w") || matchesKey(data, "alt+backspace")) {
+			if (this.query.length > 0) {
+				this.query = deletePathSegmentBackward(this.query);
+				this.selectedIndex = 0;
+				this.scrollOffset = 0;
+				this.rebuildRows();
+				this.tui.requestRender();
 			}
 			return;
 		}
@@ -972,17 +1317,19 @@ export class DashboardComponent implements Component, Focusable {
 				this.query = this.query.slice(0, -1);
 				this.selectedIndex = 0;
 				this.scrollOffset = 0;
-				this.updateFilteredSessions();
+				this.rebuildRows();
 				this.tui.requestRender();
 			}
 			return;
 		}
 
-		if (data.length === 1 && data.charCodeAt(0) >= 32) {
-			this.query += data;
+		// Printable character input (supports Kitty CSI-u, paste, and UTF-8)
+		const printable = extractPrintableInput(data);
+		if (printable !== undefined) {
+			this.query += printable;
 			this.selectedIndex = 0;
 			this.scrollOffset = 0;
-			this.updateFilteredSessions();
+			this.rebuildRows();
 			this.tui.requestRender();
 		}
 	}
@@ -1033,21 +1380,24 @@ export class DashboardComponent implements Component, Focusable {
 		// Scope & Search bar
 		const scopePill =
 			this.scope === "all"
-				? `${th.bold(th.fg("accent", `[All Projects (${this.allCount})]`))}  ${th.fg("dim", `Current (${this.cwdCount})`)}`
-				: `${th.fg("dim", `All (${this.allCount})`)}  ${th.bold(th.fg("accent", `[Current Project (${this.cwdCount})]`))}`;
+				? `${th.bold(th.fg("accent", `[All (${this.allCount})]`))} ${th.fg("dim", `Cur (${this.cwdCount})`)}`
+				: `${th.fg("dim", `All (${this.allCount})`)} ${th.bold(th.fg("accent", `[Cur (${this.cwdCount})]`))}`;
 
-		const searchStr = `${th.fg("accent", "search: ")}${this.query}${CURSOR_MARKER}`;
-		lines.push(row(`${searchStr}   ${th.fg("dim", "│")}  ${scopePill}`));
+		const placeholder = !this.query ? th.fg("dim", "filter or type ~/path") : "";
+		const searchStr = `${th.fg("accent", "search: ")}${th.fg("text", this.query)}${CURSOR_MARKER}${placeholder}`;
+		const leftW = visibleWidth(searchStr);
+		const rightW = visibleWidth(scopePill);
+		const gap = Math.max(2, modalW - 4 - leftW - rightW);
+		lines.push(row(truncateToWidth(`${searchStr}${" ".repeat(gap)}${scopePill}`, modalW - 4)));
 
 		lines.push(div());
 
-		// Sessions Table (uses cached pre-filtered sessions)
+		// Rows Table
 		const visibleRows = 11;
-		const totalCount = this.getTotalCount();
-		const hasNew = this.hasNewItem();
+		const totalCount = this.rows.length;
 
 		if (totalCount === 0) {
-			lines.push(row(th.fg("dim", "  (no matching sessions found)")));
+			lines.push(row(th.fg("dim", "  (no matching sessions or directories)")));
 			for (let i = 1; i < visibleRows; i++) {
 				lines.push(row(""));
 			}
@@ -1055,7 +1405,8 @@ export class DashboardComponent implements Component, Focusable {
 			const sliceStart = this.scrollOffset;
 			for (let i = 0; i < visibleRows; i++) {
 				const itemIndex = sliceStart + i;
-				if (itemIndex >= totalCount) {
+				const item = this.rows[itemIndex];
+				if (!item) {
 					lines.push(row(""));
 					continue;
 				}
@@ -1063,23 +1414,34 @@ export class DashboardComponent implements Component, Focusable {
 				const isSel = itemIndex === this.selectedIndex;
 				const pointer = isSel ? th.fg("accent", "❯ ") : "  ";
 
-				if (hasNew && itemIndex === 0) {
-					// Top "+ New Session" item
+				if (item.kind === "new_session") {
 					const newLabel = isSel ? th.bold(th.fg("accent", "+ New Session")) : th.fg("success", "+ New Session");
-					const newDetail = isSel ? th.fg("text", `Start fresh in ${displayPath(this.currentCwd)}`) : th.fg("dim", `Start fresh in ${displayPath(this.currentCwd)}`);
+					const newDetail = isSel
+						? th.fg("text", `Start fresh in ${displayPath(this.currentCwd)}`)
+						: th.fg("dim", `Start fresh in ${displayPath(this.currentCwd)}`);
 					const leftPart = `${pointer}${newLabel}`;
-					const rightPart = newDetail;
-					const availMid = modalW - 6 - visibleWidth(leftPart) - visibleWidth(rightPart);
-					const rightPad = Math.max(0, availMid);
-					lines.push(row(`${leftPart}${" ".repeat(rightPad)}${rightPart}`));
+					const availMid = Math.max(1, modalW - 4 - visibleWidth(leftPart) - visibleWidth(newDetail));
+					lines.push(row(truncateToWidth(`${leftPart}${" ".repeat(availMid)}${newDetail}`, modalW - 4)));
+				} else if (item.kind === "open_location_picker") {
+					const locLabel = isSel
+						? th.bold(th.fg("accent", "⇄ Switch Working Directory..."))
+						: th.fg("accent", "⇄ Switch Working Directory...");
+					const locDetail = isSel
+						? th.fg("text", "Browse or Tab-complete any folder (Ctrl+L)")
+						: th.fg("dim", "Browse or Tab-complete any folder (Ctrl+L)");
+					const leftPart = `${pointer}${locLabel}`;
+					const availMid = Math.max(1, modalW - 4 - visibleWidth(leftPart) - visibleWidth(locDetail));
+					lines.push(row(truncateToWidth(`${leftPart}${" ".repeat(availMid)}${locDetail}`, modalW - 4)));
+				} else if (item.kind === "directory") {
+					const icon = th.fg("accent", "📁 ");
+					const labelFormatted = isSel
+						? th.bold(th.fg("accent", item.label))
+						: th.fg(item.isSelfTarget ? "success" : "text", item.label);
+					const detailFormatted = isSel ? th.fg("text", item.detail) : th.fg("muted", item.detail);
+					const content = `${pointer}${icon}${labelFormatted}  ${detailFormatted}`;
+					lines.push(row(truncateToWidth(content, modalW - 4)));
 				} else {
-					const sessionIdx = hasNew ? itemIndex - 1 : itemIndex;
-					const s = this.filteredSessions[sessionIdx];
-					if (!s) {
-						lines.push(row(""));
-						continue;
-					}
-
+					const s = item.session;
 					const activeDot = s.isActiveSession ? th.fg("success", "● ") : th.fg("dim", "○ ");
 					const titleFormatted = isSel ? th.bold(th.fg("accent", s.displayTitle)) : th.fg("text", s.displayTitle);
 					const dirFormatted = isSel ? th.fg("text", s.displayPath) : th.fg("muted", s.displayPath);
@@ -1090,7 +1452,6 @@ export class DashboardComponent implements Component, Focusable {
 					const midPart = `  ${dirFormatted}`;
 					const rightPart = `  ${timeFormatted}  ${msgCount}`;
 
-					// Compose row with right-aligned metadata
 					const availableMid = modalW - 6 - visibleWidth(leftPart) - visibleWidth(rightPart);
 					let lineContent = leftPart;
 					if (availableMid > 4) {
@@ -1108,7 +1469,7 @@ export class DashboardComponent implements Component, Focusable {
 		// Footer
 		lines.push(
 			div(
-				th.fg("dim", "↑↓ nav • Enter select • Tab filter • Ctrl+L location • Esc close"),
+				th.fg("dim", "↑↓ nav • Enter select • Tab complete/scope • Ctrl+L location • Esc close"),
 			),
 		);
 		lines.push(`  ${th.fg("border", `╰${"─".repeat(modalW - 2)}╯`)}`);
@@ -1132,7 +1493,7 @@ export async function handleTargetDirectorySelection(
 ): Promise<void> {
 	const resolvedTarget = resolveTargetDir(targetDir, ctx.cwd);
 
-	if (!resolvedTarget || !fs.existsSync(resolvedTarget) || !fs.statSync(resolvedTarget).isDirectory()) {
+	if (!resolvedTarget || !isDirectorySafe(resolvedTarget)) {
 		ctx.ui.notify(`Not a directory: ${resolvedTarget || targetDir}`, "error");
 		return;
 	}
@@ -1215,6 +1576,11 @@ export async function openDashboard(ctx: ExtensionContext): Promise<void> {
 		return;
 	}
 
+	if (result.action === "select_dir" && result.selectedDir) {
+		await handleTargetDirectorySelection(result.selectedDir, ctx, activeTuiRef);
+		return;
+	}
+
 	if (result.action === "new") {
 		await createAndSwitchNewSession(ctx.cwd, ctx, activeTuiRef);
 		return;
@@ -1259,9 +1625,22 @@ export function installDashboardCommands(pi: ExtensionAPI): void {
 		},
 	});
 
-	// Register /cd slash command
+	// Register /cd slash command with live directory argument completions
 	pi.registerCommand("cd", {
 		description: "Change working directory (/cd opens Location Picker, /cd <path> switches directly)",
+		getArgumentCompletions: (argumentPrefix: string) => {
+			const cwd = process.cwd();
+			const subdirs = getSubdirectories(argumentPrefix, cwd);
+			if (subdirs.length === 0) return null;
+			return subdirs.slice(0, 50).map((d) => {
+				const disp = `${displayPath(d.fullPath)}/`;
+				return {
+					value: disp,
+					label: `${d.name}/`,
+					description: disp,
+				};
+			});
+		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			lastCommandCtx = ctx;
 			const cleaned = cleanPathArg(args);
