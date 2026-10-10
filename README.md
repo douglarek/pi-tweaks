@@ -94,25 +94,14 @@ Run `/dashboard` (or `/db`, or press `Ctrl+\`) to open the interactive agent das
 
 ### Workspace switcher and location picker
 
-Press `Ctrl+L` or run `/cd [path]` to change working directory:
+Press `Ctrl+L` inside the Dashboard (`Ctrl+\`) or run `/cd [path]` to change working directory:
 
 ![Workspace session selector showing + New Session at the top along with recent conversations.](docs/images/workspace-choice.png)
 
-- **Direct path navigation**: `/cd <path>` resolves tilde (`~`), quotes, and relative paths.
-- **Interactive location picker**: Pressing `Ctrl+L` or running `/cd` without arguments opens the directory picker with recent projects and real-time filesystem path completion.
+- **Dashboard-scoped `Ctrl+L`**: Matching `grok-build`'s `When::DashboardFocused` behavior, `Ctrl+\` opens the Dashboard globally and `Ctrl+L` opens the location picker while inside the Dashboard, keeping Pi's built-in `Ctrl+L` (model selector) untouched in the main editor.
+- **Direct path navigation**: `/cd <path>` resolves tilde (`~`), quotes, and relative paths with live `Tab` argument completion.
+- **Interactive location picker**: Pressing `Ctrl+L` in the Dashboard (or running `/cd` with no arguments) opens the directory picker with recent projects, sibling workspace directories, and real-time filesystem path completion (`Tab` to drill down, `Ctrl+W` to pop up a segment).
 - **Workspace session picker**: When switching to a project directory with existing conversations, a session picker appears with **`+ New Session` at the very top**, followed by recent conversations. Press `Enter` to start fresh, or press `Down` to resume a recent session.
-
-#### Freeing `Ctrl+L` (Keybinding configuration)
-
-By default, Pi reserves `Ctrl+L` for its built-in `app.model.select` action and skips extension shortcuts using that key with a conflict warning. To release `Ctrl+L` for the workspace location picker, configure `~/.pi/agent/keybindings.json`:
-
-```json
-{
-  "app.model.select": []
-}
-```
-
-> **Tip**: You can still change models anytime with `/model` or `Ctrl+P`, or remap the model selector to another key (e.g. `"app.model.select": "ctrl+m"`). If you prefer not to modify keybindings, you can always open the location picker via `/cd` and the dashboard via `Ctrl+\` or `/dashboard`.
 
 ### Native interactions stay native
 

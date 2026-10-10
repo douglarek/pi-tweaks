@@ -1214,7 +1214,7 @@ test("pi-tweaks regression suite", async (t) => {
 		assert.ok(Array.isArray(subdirs));
 	});
 
-	await t.test("dashboard: installDashboardCommands registers all commands and shortcuts", () => {
+	await t.test("dashboard: installDashboardCommands registers commands and scopes ctrl+l inside dashboard", () => {
 		const commands = new Map();
 		const shortcuts = new Map();
 		const mockPi = {
@@ -1225,8 +1225,15 @@ test("pi-tweaks regression suite", async (t) => {
 		assert.ok(commands.has("dashboard"), "must register /dashboard");
 		assert.ok(commands.has("db"), "must register /db");
 		assert.ok(commands.has("cd"), "must register /cd");
-		assert.ok(shortcuts.has("ctrl+l"), "must register ctrl+l shortcut");
+		assert.equal(shortcuts.has("ctrl+l"), false, "ctrl+l must not be registered globally");
 		assert.ok(shortcuts.has("ctrl+\\"), "must register ctrl+\\ shortcut");
+
+		// Inside DashboardComponent, Ctrl+L (\x0c) triggers open_location_picker
+		let dashAction = null;
+		const mockTui = { requestRender: () => {} };
+		const dash = new DashboardComponent(mockTui, [], undefined, "/tmp", theme, (res) => { dashAction = res; });
+		dash.handleInput("\x0c");
+		assert.equal(dashAction?.action, "open_location_picker");
 	});
 
 	await t.test("dashboard: SessionChoiceComponent shows + New Session at top and supports selection", () => {

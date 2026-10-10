@@ -1528,7 +1528,10 @@ export async function handleTargetDirectorySelection(
 }
 
 /** Open the interactive Location Picker modal and handle directory change */
-export async function openLocationPicker(ctx: ExtensionContext): Promise<void> {
+export async function openLocationPicker(
+	ctx: ExtensionContext,
+	returnToDashboardOnCancel = false,
+): Promise<void> {
 	if (ctx.mode !== "tui") {
 		ctx.ui.notify("Location picker requires interactive TUI mode", "error");
 		return;
@@ -1544,7 +1547,7 @@ export async function openLocationPicker(ctx: ExtensionContext): Promise<void> {
 		return new LocationPickerComponent(tui, ctx.cwd, recentDirs, theme, done);
 	});
 
-	if (result.action === "open_dashboard") {
+	if (result.action === "open_dashboard" || (result.action === "cancel" && returnToDashboardOnCancel)) {
 		await openDashboard(ctx);
 		return;
 	}
@@ -1572,7 +1575,7 @@ export async function openDashboard(ctx: ExtensionContext): Promise<void> {
 	});
 
 	if (result.action === "open_location_picker") {
-		await openLocationPicker(ctx);
+		await openLocationPicker(ctx, true);
 		return;
 	}
 
@@ -1653,17 +1656,10 @@ export function installDashboardCommands(pi: ExtensionAPI): void {
 		},
 	});
 
-	// Register shortcuts if supported by host
+	// Register global shortcut if supported by host:
+	// Only Ctrl+\ is registered globally to open Dashboard (Ctrl+L is scoped inside Dashboard
+	// just like grok-build's When::DashboardFocused, avoiding any conflict with Pi's built-in Ctrl+L).
 	if (typeof pi.registerShortcut === "function") {
-		// Register Ctrl+L shortcut for Location Picker
-		pi.registerShortcut("ctrl+l", {
-			description: "Location Picker: change working directory (recent projects / path completion)",
-			handler: async (ctx: ExtensionContext) => {
-				await openLocationPicker(ctx);
-			},
-		});
-
-		// Register Ctrl+\ shortcut for Dashboard (mirroring grok-build)
 		pi.registerShortcut("ctrl+\\", {
 			description: "Open Pi Agent Dashboard",
 			handler: async (ctx: ExtensionContext) => {
