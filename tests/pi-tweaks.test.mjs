@@ -1357,12 +1357,21 @@ test("pi-tweaks regression suite", async (t) => {
 		}
 	});
 
-	await t.test("hover brackets: thought, tool call group, and final reply each get their own bracket", () => {
-		const f = fixture({ rows: 50, thinking: "THOUGHT_BLOCK_LINE" });
+	await t.test("hover brackets: Mode B groups collapsed tools + collapsed thoughts, splits expanded thoughts/tools and final reply", () => {
+		const f = fixture({ rows: 55, thinking: "THOUGHT_BLOCK_LINE" });
 		const def = (label) => ({ renderCall: () => new Text(label, 0, 0), renderResult: () => ({ render: () => [], invalidate() {} }) });
 		const t1 = new ToolExecutionComponent("read", "t-1", {}, { showImages: false }, def("TOOL_ONE"), f.tui, process.cwd());
+		// Collapsed thinking block (hideThinkingBlock = true -> "Thinking...") between t1 and t2
+		const collapsedThoughtStep = new AssistantMessageComponent({
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "INTERMEDIATE_HIDDEN_THOUGHT" },
+				{ type: "toolCall", id: "t-2", name: "read", arguments: {} },
+			],
+			api: "openai-completions", provider: "test", model: "test", usage, stopReason: "toolUse", timestamp: Date.now(),
+		}, true, undefined, "Thinking... (step 2)", 1);
 		const t2 = new ToolExecutionComponent("read", "t-2", {}, { showImages: false }, def("TOOL_TWO"), f.tui, process.cwd());
-		// Empty intermediate assistant message (e.g. tool-only step) between t2 and t3
+		// Empty intermediate assistant message (tool-only step) between t2 and t3
 		const emptyStep = new AssistantMessageComponent({
 			role: "assistant",
 			content: [{ type: "toolCall", id: "t-3", name: "bash", arguments: {} }],
@@ -1375,6 +1384,7 @@ test("pi-tweaks regression suite", async (t) => {
 
 		const finalAsst = new AssistantMessageComponent(message("FINAL_REPLY_TEXT", "FINAL_THOUGHT_LINE"), false, undefined, "Thinking...", 1);
 		f.document.addChild(t1);
+		f.document.addChild(collapsedThoughtStep);
 		f.document.addChild(t2);
 		f.document.addChild(emptyStep);
 		f.document.addChild(t3);
@@ -1384,22 +1394,24 @@ test("pi-tweaks regression suite", async (t) => {
 		try {
 			const baseLines = f.render();
 			const t1Row = baseLines.findIndex((l) => l.includes("TOOL_ONE"));
+			const midThoughtRow = baseLines.findIndex((l) => l.includes("Thinking... (step 2)"));
 			const t2Row = baseLines.findIndex((l) => l.includes("TOOL_TWO"));
 			const t3Row = baseLines.findIndex((l) => l.includes("TOOL_THREE"));
 			const finalThoughtRow = baseLines.findIndex((l) => l.includes("FINAL_THOUGHT_LINE"));
 			const finalReplyRow = baseLines.findIndex((l) => l.includes("FINAL_REPLY_TEXT"));
 
-			// 1. Hovering any tool call wraps ALL three tools (t1..t3) in ONE unified bracket
+			// 1. Hovering t2 wraps t1 + collapsed Thinking... + t2 + t3 in ONE unified bracket
 			f.emit(35, 5, t2Row);
 			const toolHovered = f.render();
-			assert.equal(toolHovered[t1Row - 1][0], "┌", "unified tool bracket must start above first tool");
+			assert.equal(toolHovered[t1Row - 1][0], "┌", "unified bracket must start above first tool");
 			assert.equal(toolHovered[t1Row][0], "│");
+			assert.equal(toolHovered[midThoughtRow][0], "│", "collapsed thinking between tools joins the group");
 			assert.equal(toolHovered[t2Row][0], "│");
-			assert.equal(toolHovered[t3Row][0], "└", "unified tool bracket must end at last tool");
-			assert.notEqual(toolHovered[finalThoughtRow][0], "│", "tool bracket must not leak into thought");
+			assert.equal(toolHovered[t3Row][0], "└", "unified bracket must end at last tool");
+			assert.notEqual(toolHovered[finalThoughtRow][0], "│", "tool bracket must not leak into expanded thought");
 			assert.notEqual(toolHovered[finalReplyRow][0], "│", "tool bracket must not leak into final reply");
 
-			// 2. Hovering the thought block wraps ONLY the thought block
+			// 2. Hovering the expanded thought block wraps ONLY that thought block
 			f.emit(35, 5, finalThoughtRow);
 			const thoughtHovered = f.render();
 			assert.equal(thoughtHovered[finalThoughtRow - 1][0], "┌", "thought bracket must start above thought");
@@ -1413,6 +1425,15 @@ test("pi-tweaks regression suite", async (t) => {
 			assert.equal(replyHovered[finalReplyRow - 1][0], "┌", "reply bracket must start above final reply");
 			assert.equal(replyHovered[finalReplyRow][0], "└", "reply bracket must end at final reply");
 			assert.notEqual(replyHovered[finalThoughtRow][0], "└", "reply hover must not highlight thought");
+
+			// 4. Expanding t2 (Mode B split) gives t2 its own standalone bracket
+			t2.setExpanded(true);
+			f.emit(35, 5, t2Row);
+			const t2ExpandedHover = f.render();
+			assert.equal(t2ExpandedHover[t2Row - 1][0], "┌", "expanded t2 gets its own top corner");
+			assert.equal(t2ExpandedHover[t2Row][0], "└", "expanded t2 gets its own bottom corner");
+			assert.notEqual(t2ExpandedHover[t1Row - 1][0], "┌", "expanded t2 must not include t1");
+			assert.notEqual(t2ExpandedHover[t3Row][0], "└", "expanded t2 must not include t3");
 		} finally {
 			unpatch();
 			f.tui.stop();

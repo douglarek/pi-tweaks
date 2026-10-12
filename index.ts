@@ -78,25 +78,47 @@ interface HoverTUI extends TUI {
 const WIDGET_KEY = "pi-tweaks-controller";
 const MOUSE_MOVE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
 
-function decomposeAssistantBox(entry: LayoutBox): LayoutBox[] {
+interface HoverSegment {
+	box: LayoutBox;
+	/**
+	 * Matches grok-build Mode B (`group_selection_split = true` / `can_join_dense_run`):
+	 * true for collapsed groupable blocks (collapsed Thinking and collapsed ToolExecutionComponent).
+	 * Expanded blocks and non-groupable blocks (Assistant reply text, User messages) are false
+	 * and always receive their own standalone bracket.
+	 */
+	canJoinDenseRun: boolean;
+}
+
+interface AssistantInternals {
+	hideThinkingBlock?: boolean;
+	thinkingVisibilityOverrides?: Map<number, boolean>;
+}
+
+function isThoughtCollapsed(asst: AssistantInternals, runIndex: number): boolean {
+	return Boolean(asst.thinkingVisibilityOverrides?.get(runIndex) ?? asst.hideThinkingBlock);
+}
+
+function decomposeAssistantBox(entry: LayoutBox): HoverSegment[] {
 	if (entry.rect.height <= 0) return [];
 	const contentChildren = flowChildren(entry);
-	if (contentChildren.length !== 1) return [entry];
+	if (contentChildren.length !== 1) return [{ box: entry, canJoinDenseRun: false }];
 	const contentContainer = contentChildren[0];
 	const inner = flowChildren(contentContainer);
-	if (inner.length === 0) return [entry];
+	if (inner.length === 0) return [{ box: entry, canJoinDenseRun: false }];
 
 	// Only split when the assistant message contains thinking blocks (MouseRegion)
 	const hasThinking = inner.some((child) => child.component instanceof MouseRegion);
-	if (!hasThinking) return [entry];
+	if (!hasThinking) return [{ box: entry, canJoinDenseRun: false }];
 
-	const segments: LayoutBox[] = [];
+	const asst = entry.component as unknown as AssistantInternals;
+	const segments: HoverSegment[] = [];
 	let pendingSpacer: LayoutBox | undefined;
 	let currentTextGroup: LayoutBox | undefined;
+	let thinkingRunIndex = 0;
 
 	const flushTextGroup = () => {
 		if (currentTextGroup) {
-			segments.push(currentTextGroup);
+			segments.push({ box: currentTextGroup, canJoinDenseRun: false });
 			currentTextGroup = undefined;
 		}
 	};
@@ -109,19 +131,23 @@ function decomposeAssistantBox(entry: LayoutBox): LayoutBox[] {
 		}
 
 		if (child.component instanceof MouseRegion) {
-			// Each thinking block gets its own bracket (including its leading spacer row)
 			flushTextGroup();
+			const runIndex = thinkingRunIndex++;
+			const collapsed = isThoughtCollapsed(asst, runIndex);
 			const topY = pendingSpacer ? pendingSpacer.rect.y : child.rect.y;
 			const bottomY = child.rect.y + child.rect.height;
 			pendingSpacer = undefined;
 			segments.push({
-				component: child.component,
-				rect: { x: entry.rect.x, y: topY, width: entry.rect.width, height: bottomY - topY },
-				clip: entry.clip,
-				children: [],
+				box: {
+					component: child.component,
+					rect: { x: entry.rect.x, y: topY, width: entry.rect.width, height: bottomY - topY },
+					clip: entry.clip,
+					children: [],
+				},
+				canJoinDenseRun: collapsed,
 			});
 		} else {
-			// Reply text / markdown / error notice block
+			// Reply text / markdown / error notice block (non-groupable)
 			if (!currentTextGroup) {
 				const topY = pendingSpacer ? pendingSpacer.rect.y : child.rect.y;
 				const bottomY = child.rect.y + child.rect.height;
@@ -144,45 +170,47 @@ function decomposeAssistantBox(entry: LayoutBox): LayoutBox[] {
 	}
 
 	flushTextGroup();
-	return segments.length > 0 ? segments : [entry];
+	return segments.length > 0 ? segments : [{ box: entry, canJoinDenseRun: false }];
 }
 
 function chatHoverSegments(chatBox: LayoutBox): LayoutBox[] {
 	const rawEntries = flowChildren(chatBox);
-	const atomic: LayoutBox[] = [];
+	const atomic: HoverSegment[] = [];
 
 	for (const entry of rawEntries) {
 		if (!entry.rect || entry.rect.height <= 0 || entry.component instanceof Spacer) continue;
 		if (entry.component instanceof AssistantMessageComponent) {
 			atomic.push(...decomposeAssistantBox(entry));
+		} else if (entry.component instanceof ToolExecutionComponent) {
+			const isExpanded = Boolean((entry.component as unknown as { expanded?: boolean }).expanded);
+			atomic.push({ box: entry, canJoinDenseRun: !isExpanded });
 		} else {
-			atomic.push(entry);
+			atomic.push({ box: entry, canJoinDenseRun: false });
 		}
 	}
 
-	// Group consecutive tool executions into a single unified bracket
-	const grouped: LayoutBox[] = [];
+	// Mode B grouping: merge contiguous collapsed groupable blocks (collapsed tools + collapsed thoughts)
+	const grouped: HoverSegment[] = [];
 	for (const item of atomic) {
 		const prev = grouped[grouped.length - 1];
-		if (
-			item.component instanceof ToolExecutionComponent &&
-			prev &&
-			prev.component instanceof ToolExecutionComponent
-		) {
-			const bottomY = item.rect.y + item.rect.height;
-			prev.rect = {
-				...prev.rect,
-				height: bottomY - prev.rect.y,
+		if (item.canJoinDenseRun && prev?.canJoinDenseRun) {
+			const bottomY = item.box.rect.y + item.box.rect.height;
+			prev.box.rect = {
+				...prev.box.rect,
+				height: bottomY - prev.box.rect.y,
 			};
 		} else {
 			grouped.push({
-				...item,
-				rect: { ...item.rect },
+				canJoinDenseRun: item.canJoinDenseRun,
+				box: {
+					...item.box,
+					rect: { ...item.box.rect },
+				},
 			});
 		}
 	}
 
-	return grouped;
+	return grouped.map((g) => g.box);
 }
 
 function hoveredChatEntry(box: LayoutBox, pointer: Pointer, chat: Component): LayoutBox | undefined {
@@ -334,9 +362,14 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		return chat ? hoveredChatEntry(layout.root, pointer, chat) : undefined;
 	}
 
+	function getBoxKey(box = getBox()): string {
+		return box ? `${box.rect.y}:${box.rect.height}` : "";
+	}
+
 	const patchedInput = function (this: HoverTUI, data: string): unknown {
 		if (disposed) return originalInput.call(this, data);
 		const previous = getBox()?.component;
+		const previousBoxKey = getBoxKey();
 		const previousSelected = selectedQuestion;
 		const previousHit = navHoverKey();
 		const previousFooterHover = footerController.isHovered();
@@ -408,8 +441,8 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		const oldTop = scroll?.scrollTop;
 		const result = originalInput.call(this, data);
 		if (oldTop !== scroll?.scrollTop || (button & 64) !== 0) selectedQuestion = undefined;
-		if (previous !== getBox()?.component || previousHit !== navHoverKey() || previousSelected !== selectedQuestion ||
-			previousFooterHover !== footerController.isHovered()) ui.requestRender();
+		if (previous !== getBox()?.component || previousBoxKey !== getBoxKey() || previousHit !== navHoverKey() ||
+			previousSelected !== selectedQuestion || previousFooterHover !== footerController.isHovered()) ui.requestRender();
 		return result;
 	};
 

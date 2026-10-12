@@ -35,10 +35,10 @@ When browsing earlier messages, the verbose jump-to-latest banner becomes a smal
 
 ### Message hover brackets
 
-Hover over any chat message to reveal a subtle left-side bracket spanning the entry. Matching `grok-build`'s block grouping:
-- Each **thinking (thought)** block gets its own bracket.
-- Consecutive **tool calls** are grouped together under a single unified bracket.
-- The **final assistant reply** (as well as user messages, command output, custom entries, summaries, and notices) gets its own bracket.
+Hover over any chat message to reveal a subtle left-side bracket spanning the entry. Matching `grok-build`'s Mode B (`group_selection_split`) grouping:
+- Consecutive **collapsed tool calls** and **collapsed `Thinking...` blocks** are grouped together under a single unified bracket (interspersed collapsed thoughts do not split a tool run).
+- Any **expanded thinking block** or **expanded tool output** splits out and gets its own standalone bracket.
+- The **final assistant reply** (as well as user messages, command output, custom entries, summaries, and notices) always gets its own bracket.
 
 ![A hovered assistant message has a subtle bracket; the navigation destination has a highlighted bracket.](docs/images/message-hover.png)
 
