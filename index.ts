@@ -30,6 +30,12 @@ import { installQueueDispatch, type QueueDispatchController, type SessionLike } 
 import { installCompactFooter, type CompactFooterController } from "./lib/compact-footer.ts";
 import { installDashboardCommands, registerDashboardTui, registerDashboardSession, registerDashboardEditor } from "./lib/dashboard.ts";
 import { resolveSession, resolveEditor } from "./lib/queue-dispatch.ts";
+import {
+	createRecapController,
+	RecapEntryView,
+	RECAP_ENTRY_TYPE,
+	type RecapEntryData,
+} from "./lib/recap.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
@@ -39,6 +45,7 @@ interface PiTweaksOptions {
 	queueDispatch?: () => boolean;
 	footer?: () => boolean;
 	session?: () => SessionLike | undefined;
+	onTerminalInput?: (data: string) => void;
 }
 export interface PiTweaksController {
 	(): void;
@@ -50,6 +57,8 @@ export interface PiTweaksController {
 	dispatchQueuedMessage?(): Promise<boolean>;
 	isFooterHovered?(): boolean;
 	setFooterHovered?(hovered: boolean): boolean;
+	hasOverlay?(): boolean;
+	requestRender?(): void;
 }
 interface NavigationLease {
 	active: boolean;
@@ -406,6 +415,9 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		if (data === "\x1b[O") {
 			pointer = undefined;
 			if (footerController.setHovered(false) || previousIndicatorHover) ui.requestRender();
+			options.onTerminalInput?.(data);
+		} else if (data === "\x1b[I") {
+			options.onTerminalInput?.(data);
 		}
 		const mouse = MOUSE_MOVE.exec(data);
 		if (!mouse && suggestionsEnabled() && !ui.hasOverlay()) {
@@ -603,22 +615,38 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 			if (changed) ui.requestRender();
 			return changed;
 		},
+		hasOverlay: () => ui.hasOverlay(),
+		requestRender: () => ui.requestRender(),
 	});
 }
 
 export default function piTweaks(pi: ExtensionAPI): void {
 	let detach: PiTweaksController | undefined;
+	const recap = createRecapController(
+		pi,
+		() => detach?.hasOverlay?.() ?? false,
+		() => detach?.requestRender?.(),
+	);
 	function remove(): void {
+		recap.dispose();
 		detach?.();
 		detach = undefined;
 	}
+	pi.registerEntryRenderer?.<RecapEntryData>(RECAP_ENTRY_TYPE, (entry, options, theme) => {
+		const summary = entry.data?.summary?.trim();
+		if (!summary) return undefined;
+		return new RecapEntryView(summary, () => theme, options.expanded, 1, () => detach?.requestRender?.());
+	});
 	pi.on("session_start", (_event, ctx) => {
 		remove();
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		ctx.ui.setWidget(WIDGET_KEY, (tui) => {
 			if (tui.mode === "fullscreen") {
 				try {
-					detach = installPiTweaks(tui, () => ctx.ui.theme);
+					detach = installPiTweaks(tui, () => ctx.ui.theme, {
+						onTerminalInput: (data) => recap.onTerminalInput(data),
+					});
+					recap.onSessionStart(ctx);
 				} catch (error) {
 					ctx.ui.notify(`pi-tweaks could not attach: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
@@ -632,6 +660,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", remove);
 
 	pi.on("agent_settled", async (event, ctx) => {
+		recap.onTurnSettled(ctx);
 		if (event.aborted) {
 			detach?.clearSuggestion?.();
 			return;
@@ -694,10 +723,12 @@ export default function piTweaks(pi: ExtensionAPI): void {
 	});
 
 	pi.on("user_bash", () => {
+		recap.onNewPrompt();
 		detach?.clearSuggestion?.();
 	});
 
 	pi.on("before_agent_start", () => {
+		recap.onNewPrompt();
 		detach?.clearSuggestion?.();
 	});
 

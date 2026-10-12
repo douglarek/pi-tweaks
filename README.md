@@ -106,6 +106,13 @@ Press `Ctrl+L` inside the Dashboard (`Ctrl+\`) or run `/cd [path]` to change wor
 - **Interactive location picker**: Pressing `Ctrl+L` in the Dashboard (or running `/cd` with no arguments) opens the directory picker with recent projects, sibling workspace directories, and real-time filesystem path completion (`Tab` to drill down, `Ctrl+W` to pop up a segment).
 - **Workspace session picker**: When switching to a project directory with existing conversations, a session picker appears with **`+ New Session` at the very top**, followed by recent conversations. Press `Enter` to start fresh, or press `Down` to resume a recent session.
 
+### Automatic session recap ("where was I")
+
+Ported from `grok-build`'s `session_recap` and `FocusTracker`:
+- When the terminal is unfocused for at least **3 minutes** on an idle session with at least **3 user turns** (and at least one new turn since the last recap), `pi-tweaks` pre-generates a one-sentence recap in the user's conversation language.
+- The recap is appended as a non-context `CustomEntry` (`Recap` header + muted summary body, clickable to collapse into a single-line preview) so it never pollutes LLM context.
+- If a new prompt is sent while a recap is generating, the in-flight recap is automatically cancelled.
+
 ### Native interactions stay native
 
 Text selection/copy, links, thinking expansion, tool expansion, keyboard focus, and overlays remain on Pi's normal input path. Brackets and previews are screen decorations, not transcript text.

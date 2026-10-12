@@ -44,6 +44,20 @@ const { shortenPath, renderCompactFooter, installCompactFooter, resolveFooter, f
 	await jiti.import(fileURLToPath(new URL("../lib/compact-footer.ts", import.meta.url)));
 const { displayPath, expandTilde, cleanPathArg, resolveTargetDir, formatRelativeTime, collectRecentDirs, getSubdirectories, installDashboardCommands, SessionChoiceComponent, LocationPickerComponent, DashboardComponent, extractPrintableInput, deletePathSegmentBackward } =
 	await jiti.import(fileURLToPath(new URL("../lib/dashboard.ts", import.meta.url)));
+const {
+	RECAP_MAX_CHARS,
+	RECAP_AUTO_RAW_DISPLAY_MAX,
+	RECAP_ENTRY_TYPE,
+	cleanRecapText,
+	shouldSuppressAutoRecapDisplay,
+	recapGate,
+	mainTurnCount,
+	lastRecapWatermark,
+	buildRecapTranscript,
+	FocusTracker,
+	RecapEntryView,
+	createRecapController,
+} = await jiti.import(fileURLToPath(new URL("../lib/recap.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
@@ -1448,6 +1462,167 @@ test("pi-tweaks regression suite", async (t) => {
 		} finally {
 			unpatch();
 			f.tui.stop();
+		}
+	});
+
+	await t.test("recap: cleanRecapText, shouldSuppressAutoRecapDisplay, recapGate, and buildRecapTranscript", () => {
+		// Whitespace collapsing, label stripping, quote stripping, and length capping
+		assert.equal(cleanRecapText("Refactored   the\n\nparser\tand added   tests."), "Refactored the parser and added tests.");
+		assert.equal(cleanRecapText("Recap: fixed the auth bug"), "fixed the auth bug");
+		assert.equal(cleanRecapText("Recap — wired up the API"), "wired up the API");
+		assert.equal(cleanRecapText("Session recap: updated docs"), "updated docs");
+		assert.equal(cleanRecapText('"did the thing"'), "did the thing");
+		assert.equal(cleanRecapText("'did the thing'"), "did the thing");
+		assert.equal(cleanRecapText("<think>hidden thought</think>We fixed the race condition."), "We fixed the race condition.");
+
+		const long = "word ".repeat(RECAP_MAX_CHARS);
+		const capped = cleanRecapText(long);
+		assert.ok(capped.endsWith("…"));
+		assert.equal(shouldSuppressAutoRecapDisplay("x".repeat(RECAP_AUTO_RAW_DISPLAY_MAX + 1), "short"), true);
+		assert.equal(shouldSuppressAutoRecapDisplay("short", "short"), false);
+		assert.equal(shouldSuppressAutoRecapDisplay("short", capped), true);
+
+		// Gate conditions (auto vs manual)
+		assert.equal(recapGate(0, 0, true, true).ok, false);
+		assert.equal(recapGate(2, 0, true, true).ok, false, "auto requires at least 3 turns");
+		assert.equal(recapGate(3, 3, true, true).ok, false, "auto requires new turn since last watermark");
+		assert.equal(recapGate(3, 0, true, false).ok, false, "auto requires idle threshold");
+		assert.equal(recapGate(3, 0, true, true).ok, true);
+
+		// Transcript & turn counting
+		const entries = [
+			{ type: "message", message: { role: "user", content: "First user prompt" } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "secret" }, { type: "text", text: "First reply" }] } },
+			{ type: "custom", customType: RECAP_ENTRY_TYPE, data: { mainTurns: 1, summary: "Old recap" } },
+			{ type: "message", message: { role: "user", content: "Second user prompt" } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Second reply" }] } },
+			{ type: "message", message: { role: "user", content: "Third user prompt" } },
+		];
+		assert.equal(mainTurnCount(entries), 3);
+		assert.equal(lastRecapWatermark(entries), 1);
+		const transcript = buildRecapTranscript(entries);
+		assert.ok(transcript.includes("User: First user prompt"));
+		assert.ok(transcript.includes("Agent: First reply"));
+		assert.ok(!transcript.includes("secret"), "thinking blocks must be excluded from recap transcript");
+	});
+
+	await t.test("recap: FocusTracker away threshold, retry backoff, and re-arming", () => {
+		const tracker = new FocusTracker(5_000, 90_000);
+		assert.equal(tracker.isFocused(), true);
+		assert.equal(tracker.recapDue(10_000), false, "focused terminal is never away");
+
+		tracker.onFocusLost(1_000);
+		assert.equal(tracker.isFocused(), false);
+		assert.equal(tracker.recapDue(4_000), false, "not away long enough yet");
+		assert.equal(tracker.recapDue(6_000), true, "due after away threshold");
+
+		// Note attempt starts 90s retry backoff without consuming the away period
+		tracker.noteAutoRecapAttempt(6_000);
+		assert.equal(tracker.recapDue(30_000), false, "must not re-fire before retry backoff");
+		assert.equal(tracker.recapDue(97_000), true, "retries after backoff interval");
+
+		// Once shown, stops further requests until a new away period
+		tracker.markRecapShown();
+		assert.equal(tracker.recapDue(200_000), false);
+		tracker.onFocusGained();
+		tracker.onFocusLost(300_000);
+		assert.equal(tracker.recapDue(306_000), true, "re-arms on new away period");
+	});
+
+	await t.test("recap: createRecapController generates auto recap after idle away period and RecapEntryView renders/folds", async () => {
+		let now = 1_000;
+		const appended = [];
+		let renders = 0;
+		const entries = [
+			{ type: "message", message: { role: "user", content: "Q1: check dashboard" } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Checked dashboard." }] } },
+			{ type: "message", message: { role: "user", content: "Q2: fix location picker" } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Fixed location picker." }] } },
+			{ type: "message", message: { role: "user", content: "Q3: align hover brackets" } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Aligned hover brackets with Mode B." }] } },
+		];
+
+		const mockPi = {
+			appendEntry(customType, data) {
+				appended.push({ customType, data });
+				entries.push({ type: "custom", customType, data });
+			},
+		};
+		const mockCtx = {
+			hasUI: true,
+			mode: "tui",
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+			model: { id: "test-model" },
+			modelRegistry: {
+				complete: async () => ({
+					content: "Recap: We fixed the location picker and aligned hover brackets with Mode B.",
+				}),
+			},
+			sessionManager: {
+				getEntries: () => entries,
+			},
+		};
+
+		const controller = createRecapController(
+			mockPi,
+			() => false,
+			() => { renders++; },
+			{ recapMinIdleMs: 180_000, pollIntervalMs: 0, retryIntervalMs: 90_000, now: () => now },
+		);
+
+		try {
+			controller.onSessionStart(mockCtx);
+			controller.onTurnSettled(mockCtx);
+
+			// Lose focus at t = 1_000, return after 60s (< 180s threshold) -> no recap
+			controller.onTerminalInput("\x1b[O");
+			now += 60_000;
+			controller.onTerminalInput("\x1b[I");
+			assert.equal(appended.length, 0);
+
+			// Lose focus again, wait 185s (>= 180s threshold), then regain focus -> triggers auto recap
+			controller.onTerminalInput("\x1b[O");
+			now += 185_000;
+			assert.equal(controller.focusTracker.recapDue(now), true);
+			const generated = await controller.triggerAutoRecap();
+			assert.equal(generated, true);
+			assert.equal(appended.length, 1);
+			assert.equal(appended[0].customType, RECAP_ENTRY_TYPE);
+			assert.equal(appended[0].data.summary, "We fixed the location picker and aligned hover brackets with Mode B.");
+			assert.equal(appended[0].data.auto, true);
+			assert.equal(appended[0].data.mainTurns, 3);
+			assert.ok(renders > 0);
+
+			// Second attempt without a new user turn is gated off by watermark
+			controller.onTerminalInput("\x1b[O");
+			now += 200_000;
+			assert.equal(await controller.triggerAutoRecap(), false);
+			assert.equal(appended.length, 1);
+
+			// Test RecapEntryView rendering (Expanded by default, click toggles to Collapsed)
+			let viewRenders = 0;
+			const view = new RecapEntryView(
+				appended[0].data.summary,
+				() => theme,
+				false,
+				1,
+				() => { viewRenders++; },
+			);
+			const expandedLines = view.render(60).map(stripTerminalSequences);
+			assert.ok(expandedLines.length >= 3, "expanded recap has header + blank + body");
+			assert.equal(expandedLines[0].trim(), "Recap");
+			assert.ok(expandedLines.slice(2).join(" ").includes("We fixed the location picker"));
+
+			// Click to collapse into a single preview line
+			view.handleMouse({ type: "click", button: "left", row: 0, col: 2 });
+			assert.equal(view.isCollapsed(), true);
+			assert.equal(viewRenders, 1);
+			const collapsedLines = view.render(60).map(stripTerminalSequences);
+			assert.equal(collapsedLines.length, 1, "collapsed recap is a single line");
+			assert.ok(collapsedLines[0].includes("Recap  We fixed the location picker"));
+		} finally {
+			controller.dispose();
 		}
 	});
 });
