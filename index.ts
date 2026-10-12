@@ -11,11 +11,13 @@
  * Unload/reload restores methods, content widths and scrollbar settings. Private TUI hooks may need adapting after Pi upgrades.
  */
 import {
+	AssistantMessageComponent,
+	ToolExecutionComponent,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { compositeTuiLine, Spacer, sliceByColumn, stripTerminalSequences,
+import { compositeTuiLine, MouseRegion, Spacer, sliceByColumn, stripTerminalSequences,
 	type Component, type TUI } from "@earendil-works/pi-tui";
 import { contains, transcriptContainer, flowChildren, chatEntryBox, questionSnapshot, navEligible,
 	computeQuestionRail, railContains, railGutterContains, railHit, paintQuestionNavigation, NAV_GUTTER_WIDTH,
@@ -76,16 +78,121 @@ interface HoverTUI extends TUI {
 const WIDGET_KEY = "pi-tweaks-controller";
 const MOUSE_MOVE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
 
+function decomposeAssistantBox(entry: LayoutBox): LayoutBox[] {
+	if (entry.rect.height <= 0) return [];
+	const contentChildren = flowChildren(entry);
+	if (contentChildren.length !== 1) return [entry];
+	const contentContainer = contentChildren[0];
+	const inner = flowChildren(contentContainer);
+	if (inner.length === 0) return [entry];
+
+	// Only split when the assistant message contains thinking blocks (MouseRegion)
+	const hasThinking = inner.some((child) => child.component instanceof MouseRegion);
+	if (!hasThinking) return [entry];
+
+	const segments: LayoutBox[] = [];
+	let pendingSpacer: LayoutBox | undefined;
+	let currentTextGroup: LayoutBox | undefined;
+
+	const flushTextGroup = () => {
+		if (currentTextGroup) {
+			segments.push(currentTextGroup);
+			currentTextGroup = undefined;
+		}
+	};
+
+	for (const child of inner) {
+		if (child.rect.height <= 0) continue;
+		if (child.component instanceof Spacer) {
+			pendingSpacer = child;
+			continue;
+		}
+
+		if (child.component instanceof MouseRegion) {
+			// Each thinking block gets its own bracket (including its leading spacer row)
+			flushTextGroup();
+			const topY = pendingSpacer ? pendingSpacer.rect.y : child.rect.y;
+			const bottomY = child.rect.y + child.rect.height;
+			pendingSpacer = undefined;
+			segments.push({
+				component: child.component,
+				rect: { x: entry.rect.x, y: topY, width: entry.rect.width, height: bottomY - topY },
+				clip: entry.clip,
+				children: [],
+			});
+		} else {
+			// Reply text / markdown / error notice block
+			if (!currentTextGroup) {
+				const topY = pendingSpacer ? pendingSpacer.rect.y : child.rect.y;
+				const bottomY = child.rect.y + child.rect.height;
+				pendingSpacer = undefined;
+				currentTextGroup = {
+					component: child.component,
+					rect: { x: entry.rect.x, y: topY, width: entry.rect.width, height: bottomY - topY },
+					clip: entry.clip,
+					children: [],
+				};
+			} else {
+				const bottomY = child.rect.y + child.rect.height;
+				pendingSpacer = undefined;
+				currentTextGroup.rect = {
+					...currentTextGroup.rect,
+					height: bottomY - currentTextGroup.rect.y,
+				};
+			}
+		}
+	}
+
+	flushTextGroup();
+	return segments.length > 0 ? segments : [entry];
+}
+
+function chatHoverSegments(chatBox: LayoutBox): LayoutBox[] {
+	const rawEntries = flowChildren(chatBox);
+	const atomic: LayoutBox[] = [];
+
+	for (const entry of rawEntries) {
+		if (!entry.rect || entry.rect.height <= 0 || entry.component instanceof Spacer) continue;
+		if (entry.component instanceof AssistantMessageComponent) {
+			atomic.push(...decomposeAssistantBox(entry));
+		} else {
+			atomic.push(entry);
+		}
+	}
+
+	// Group consecutive tool executions into a single unified bracket
+	const grouped: LayoutBox[] = [];
+	for (const item of atomic) {
+		const prev = grouped[grouped.length - 1];
+		if (
+			item.component instanceof ToolExecutionComponent &&
+			prev &&
+			prev.component instanceof ToolExecutionComponent
+		) {
+			const bottomY = item.rect.y + item.rect.height;
+			prev.rect = {
+				...prev.rect,
+				height: bottomY - prev.rect.y,
+			};
+		} else {
+			grouped.push({
+				...item,
+				rect: { ...item.rect },
+			});
+		}
+	}
+
+	return grouped;
+}
+
 function hoveredChatEntry(box: LayoutBox, pointer: Pointer, chat: Component): LayoutBox | undefined {
 	if (!box.rect || !box.clip || !Array.isArray(box.children) ||
 		!contains(box.rect, pointer) || !contains(box.clip, pointer)) return undefined;
-	const children = flowChildren(box);
 	if (box.component === chat) {
-		const entry = children.find((child) => contains(child.rect, pointer) && contains(child.clip, pointer));
-		if (!entry || entry.component instanceof Spacer) return undefined;
-		// Every message type qualifies, including user and skill invocation entries.
-		return entry;
+		const segments = chatHoverSegments(box);
+		return segments.find((seg) => contains(seg.rect, pointer) && contains(seg.clip, pointer));
 	}
+	const children = flowChildren(box);
 	for (let i = children.length - 1; i >= 0; i--) {
 		const result = hoveredChatEntry(children[i], pointer, chat);
 		if (result) return result;
