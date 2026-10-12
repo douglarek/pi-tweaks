@@ -9,7 +9,7 @@
  * without mutating or polluting the LLM conversation context.
  */
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { MouseRegion, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
+import { Container, MouseRegion, Spacer, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 
 export const RECAP_ENTRY_TYPE = "recap";
 
@@ -356,12 +356,13 @@ export class FocusTracker {
 }
 
 /**
- * Render component for a `Recap` custom entry, matching `SessionEventBlock::recap_output` in `grok-build`:
+ * Render component for a `Recap` entry, matching `SessionEventBlock::recap_output` in `grok-build`:
+ * - Loading state (`summary === ""`): shows `Recap` header only.
  * - Expanded by default: bold "Recap" header + blank line + wrapped muted summary body.
  * - Clickable to toggle into single-line collapsed preview: `Recap  <first-line preview>`.
  */
 export class RecapEntryView implements Component {
-	private readonly summary: string;
+	private summary: string;
 	private readonly getTheme: () => Theme;
 	private readonly outputPad: number;
 	private readonly onRequestRender?: () => void;
@@ -379,8 +380,6 @@ export class RecapEntryView implements Component {
 		this.getTheme = getTheme;
 		this.outputPad = outputPad;
 		this.onRequestRender = onRequestRender;
-		// In grok-build (`session_event.rs:795`), Recap defaults to DisplayMode::Expanded
-		// so returning users can read it immediately; clicking toggles collapsed/expanded.
 		const inner: Component = {
 			render: (width: number) => this.renderInner(width, hostExpanded),
 			invalidate: () => {},
@@ -396,6 +395,16 @@ export class RecapEntryView implements Component {
 		});
 	}
 
+	setSummary(summary: string): void {
+		this.summary = summary;
+		this.invalidate();
+		this.onRequestRender?.();
+	}
+
+	getSummary(): string {
+		return this.summary;
+	}
+
 	isCollapsed(_hostExpanded = false): boolean {
 		if (this.collapsedOverride !== undefined) return this.collapsedOverride;
 		return false;
@@ -405,6 +414,14 @@ export class RecapEntryView implements Component {
 		const th = this.getTheme();
 		const pad = " ".repeat(Math.max(1, this.outputPad));
 		const contentWidth = Math.max(20, width - pad.length * 2);
+
+		// In-flight loading state (empty summary): header only, matching grok-build `session_event.rs:649`
+		if (!this.summary.trim()) {
+			const loadingHeader = `${pad}${th.fg("muted", th.bold("Recap"))}`;
+			const vis = visibleWidth(loadingHeader);
+			return [loadingHeader + " ".repeat(Math.max(0, width - vis))];
+		}
+
 		const collapsed = this.isCollapsed(hostExpanded);
 
 		if (collapsed) {
@@ -451,17 +468,20 @@ export interface RecapOptions {
 	pollIntervalMs?: number;
 	retryIntervalMs?: number;
 	now?: () => number;
+	getChatContainer?: () => Container | undefined;
 }
 
 export interface RecapController {
 	readonly focusTracker: FocusTracker;
-	onSessionStart(ctx: ExtensionContext): void;
+	onSessionStart(ctx: ExtensionContext, reason?: string): void;
 	onTurnSettled(ctx: ExtensionContext): void;
 	onNewPrompt(): void;
 	onTerminalInput(data: string): void;
 	triggerAutoRecap(): Promise<boolean>;
 	dispose(): void;
 }
+
+const sessionMemoryWatermarks = new Map<string, number>();
 
 export function createRecapController(
 	pi: ExtensionAPI,
@@ -483,18 +503,38 @@ export function createRecapController(
 	let recapEpoch = 0;
 	let recapInFlight = false;
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
+	let startupTimer: ReturnType<typeof setTimeout> | undefined;
+	let pendingMount: { parent: Container; wrapper: Container } | undefined;
+
+	function currentSessionKey(ctx: ExtensionContext | undefined = activeCtx): string {
+		return ctx?.sessionManager?.getSessionFile?.() ?? "__default__";
+	}
+
+	function clearPendingMount(): void {
+		if (pendingMount) {
+			pendingMount.parent.removeChild(pendingMount.wrapper);
+			pendingMount = undefined;
+			onRequestRender();
+		}
+	}
 
 	function syncWatermark(entries: unknown[]): number {
 		const mainTurns = mainTurnCount(entries);
 		const persisted = lastRecapWatermark(entries);
-		if (persisted > lastRecapMainTurn) {
-			lastRecapMainTurn = persisted;
-		}
+		const inMem = sessionMemoryWatermarks.get(currentSessionKey()) ?? 0;
+		const highest = Math.max(persisted, inMem, lastRecapMainTurn);
+		lastRecapMainTurn = highest;
 		// Heal watermark if conversation shrank (e.g. after rewind / fork / tree navigation)
 		if (lastRecapMainTurn > mainTurns) {
 			lastRecapMainTurn = Math.max(0, mainTurns - 1);
+			sessionMemoryWatermarks.set(currentSessionKey(), lastRecapMainTurn);
 		}
 		return mainTurns;
+	}
+
+	function commitWatermark(mainTurns: number): void {
+		lastRecapMainTurn = mainTurns;
+		sessionMemoryWatermarks.set(currentSessionKey(), mainTurns);
 	}
 
 	function isEligibleForAutoRecap(): boolean {
@@ -504,7 +544,7 @@ export function createRecapController(
 		return true;
 	}
 
-	async function handleAutoRecap(): Promise<boolean> {
+	async function handleAutoRecap(bypassIdleGate = false): Promise<boolean> {
 		if (!isEligibleForAutoRecap() || !activeCtx) return false;
 		const ctx = activeCtx;
 		const epoch = recapEpoch;
@@ -513,10 +553,14 @@ export function createRecapController(
 
 		const now = nowFn();
 		const idleMs = lastTurnEndAt > 0 ? now - lastTurnEndAt : 0;
-		const idleOk = lastTurnEndAt > 0 && idleMs >= minIdleMs;
+		const idleOk = bypassIdleGate || (lastTurnEndAt > 0 && idleMs >= minIdleMs);
 
-		const gate = recapGate(mainTurns, lastRecapMainTurn, true, idleOk);
-		if (!gate.ok) return false;
+		if (bypassIdleGate) {
+			if (mainTurns === 0 || mainTurns <= lastRecapMainTurn) return false;
+		} else {
+			const gate = recapGate(mainTurns, lastRecapMainTurn, true, idleOk);
+			if (!gate.ok) return false;
+		}
 		if (recapInFlight) return false;
 
 		const transcript = buildRecapTranscript(entries);
@@ -527,6 +571,20 @@ export function createRecapController(
 
 		recapInFlight = true;
 		focusTracker.noteAutoRecapAttempt(now);
+
+		// Mount an in-flight loading Recap block in chatContainer if available
+		const chatContainer = options.getChatContainer?.();
+		let liveView: RecapEntryView | undefined;
+		let liveWrapper: Container | undefined;
+		if (chatContainer) {
+			liveView = new RecapEntryView("", () => ctx.ui.theme, false, 1, onRequestRender);
+			liveWrapper = new Container();
+			liveWrapper.addChild(new Spacer(1));
+			liveWrapper.addChild(liveView);
+			chatContainer.addChild(liveWrapper);
+			pendingMount = { parent: chatContainer, wrapper: liveWrapper };
+			onRequestRender();
+		}
 
 		try {
 			const result = await ctx.modelRegistry.complete(
@@ -563,26 +621,36 @@ export function createRecapController(
 			const summary = cleanRecapText(raw);
 			if (!summary) {
 				recapInFlight = false;
+				clearPendingMount();
 				return false;
 			}
 
 			// Cancelled by a new user prompt while generating
 			if (recapEpoch !== epoch) {
 				recapInFlight = false;
+				clearPendingMount();
 				return false;
 			}
 
 			// Long-tail auto output: commit watermark & mark shown, but suppress display
 			if (shouldSuppressAutoRecapDisplay(raw, summary)) {
-				lastRecapMainTurn = mainTurns;
+				commitWatermark(mainTurns);
 				recapInFlight = false;
 				focusTracker.markRecapShown();
+				clearPendingMount();
 				return false;
 			}
 
-			lastRecapMainTurn = mainTurns;
+			commitWatermark(mainTurns);
 			recapInFlight = false;
 			focusTracker.markRecapShown();
+
+			if (liveView && liveWrapper) {
+				pendingMount = undefined;
+				liveView.setSummary(summary);
+				onRequestRender();
+				return true;
+			}
 
 			const preview = Array.from(summary).slice(0, RECAP_PERSIST_MAX_CHARS).join("");
 			const data: RecapEntryData = {
@@ -592,11 +660,12 @@ export function createRecapController(
 				mainTurns,
 				timestamp: nowFn(),
 			};
-			pi.appendEntry(RECAP_ENTRY_TYPE, data);
+			pi.appendEntry?.(RECAP_ENTRY_TYPE, data);
 			onRequestRender();
 			return true;
 		} catch {
 			recapInFlight = false;
+			clearPendingMount();
 			return false;
 		}
 	}
@@ -612,7 +681,7 @@ export function createRecapController(
 				lastTurnEndAt > 0 &&
 				now - lastTurnEndAt >= minIdleMs;
 			if ((focusTracker.recapDue(now) || inputIdleDue) && isEligibleForAutoRecap()) {
-				void handleAutoRecap();
+				void handleAutoRecap(false);
 			}
 		}, pollIntervalMs);
 		pollTimer.unref?.();
@@ -623,14 +692,19 @@ export function createRecapController(
 			clearInterval(pollTimer);
 			pollTimer = undefined;
 		}
+		if (startupTimer) {
+			clearTimeout(startupTimer);
+			startupTimer = undefined;
+		}
 	}
 
 	return {
 		focusTracker,
-		onSessionStart(ctx: ExtensionContext) {
+		onSessionStart(ctx: ExtensionContext, reason?: string) {
 			activeCtx = ctx;
 			recapEpoch++;
 			recapInFlight = false;
+			clearPendingMount();
 			focusTracker.onFocusGained();
 			const entries = ctx.sessionManager?.getEntries?.() ?? [];
 			lastRecapMainTurn = 0;
@@ -640,15 +714,19 @@ export function createRecapController(
 			const persistedTs = extractLastEntryTimestamp(entries);
 			lastTurnEndAt = persistedTs > 0 ? persistedTs : entries.length > 0 ? now : 0;
 			startPolling();
-			// If attaching/resuming a session that has already been idle >= minIdleMs with >= 3 turns,
-			// generate the "where was I" recap immediately on session load.
-			if (
+
+			const isResumedOrReloaded = reason === "resume" || reason === "reload";
+			const isIdleStartup =
 				persistedTs > 0 &&
 				now - persistedTs >= minIdleMs &&
-				mainTurns >= MIN_TURNS_FOR_AUTO_RECAP &&
-				mainTurns > lastRecapMainTurn
-			) {
-				void handleAutoRecap();
+				mainTurns >= MIN_TURNS_FOR_AUTO_RECAP;
+			if ((isResumedOrReloaded && mainTurns >= 1 && mainTurns > lastRecapMainTurn) ||
+				(isIdleStartup && mainTurns > lastRecapMainTurn)) {
+				startupTimer = setTimeout(() => {
+					startupTimer = undefined;
+					void handleAutoRecap(isResumedOrReloaded);
+				}, 60);
+				startupTimer.unref?.();
 			}
 		},
 		onTurnSettled(ctx: ExtensionContext) {
@@ -661,6 +739,7 @@ export function createRecapController(
 		},
 		onNewPrompt() {
 			recapEpoch++;
+			clearPendingMount();
 			lastInputAt = nowFn();
 		},
 		onTerminalInput(data: string) {
@@ -672,17 +751,18 @@ export function createRecapController(
 				focusTracker.onFocusGained();
 				lastInputAt = now;
 				if (due && isEligibleForAutoRecap()) {
-					void handleAutoRecap();
+					void handleAutoRecap(false);
 				}
 			} else {
 				lastInputAt = now;
 			}
 		},
 		triggerAutoRecap() {
-			return handleAutoRecap();
+			return handleAutoRecap(false);
 		},
 		dispose() {
 			stopPolling();
+			clearPendingMount();
 			recapEpoch++;
 			recapInFlight = false;
 			activeCtx = undefined;

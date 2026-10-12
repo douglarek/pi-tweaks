@@ -17,7 +17,7 @@ import {
 	type ExtensionContext,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { compositeTuiLine, MouseRegion, Spacer, sliceByColumn, stripTerminalSequences,
+import { compositeTuiLine, Container, MouseRegion, Spacer, sliceByColumn, stripTerminalSequences,
 	type Component, type TUI } from "@earendil-works/pi-tui";
 import { contains, transcriptContainer, flowChildren, chatEntryBox, questionSnapshot, navEligible,
 	computeQuestionRail, railContains, railGutterContains, railHit, paintQuestionNavigation, NAV_GUTTER_WIDTH,
@@ -59,6 +59,7 @@ export interface PiTweaksController {
 	setFooterHovered?(hovered: boolean): boolean;
 	hasOverlay?(): boolean;
 	requestRender?(): void;
+	getChatContainer?(): Container | undefined;
 }
 interface NavigationLease {
 	active: boolean;
@@ -615,6 +616,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		},
 		hasOverlay: () => ui.hasOverlay(),
 		requestRender: () => ui.requestRender(),
+		getChatContainer: () => ui.currentLayout ? transcriptContainer(ui.currentLayout) as Container | undefined : undefined,
 	});
 }
 
@@ -624,6 +626,9 @@ export default function piTweaks(pi: ExtensionAPI): void {
 		pi,
 		() => detach?.hasOverlay?.() ?? false,
 		() => detach?.requestRender?.(),
+		{
+			getChatContainer: () => detach?.getChatContainer?.(),
+		},
 	);
 	function remove(): void {
 		recap.dispose();
@@ -635,7 +640,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 		if (!summary) return undefined;
 		return new RecapEntryView(summary, () => theme, options.expanded, 1, () => detach?.requestRender?.());
 	});
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		remove();
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		ctx.ui.setWidget(WIDGET_KEY, (tui) => {
@@ -644,7 +649,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 					detach = installPiTweaks(tui, () => ctx.ui.theme, {
 						onTerminalInput: (data) => recap.onTerminalInput(data),
 					});
-					recap.onSessionStart(ctx);
+					recap.onSessionStart(ctx, (event as { reason?: string } | undefined)?.reason);
 				} catch (error) {
 					ctx.ui.notify(`pi-tweaks could not attach: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
