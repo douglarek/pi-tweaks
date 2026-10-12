@@ -346,10 +346,21 @@ test("pi-tweaks regression suite", async (t) => {
 		try {
 			f.scroll.scrollToStart();
 			const lines = f.render();
-			assert.ok(lines.some((line) => line.includes("↓")));
+			assert.ok(lines.some((line) => line.includes("▼")));
 			assert.ok(lines.every((line) => !line.includes("Jump to latest") && !line.includes("Ctrl+End")));
 			const rect = f.tui.scrollToEndIndicatorRect;
 			assert.equal(rect.width, 3);
+			// Hovering inside the 3-col hit rect brightens the arrow from muted to text
+			const idleRowRaw = f.tui.getScreenLines()[rect.row];
+			f.emit(35, rect.column + 1, rect.row);
+			f.render();
+			const hoveredRowRaw = f.tui.getScreenLines()[rect.row];
+			assert.notEqual(hoveredRowRaw, idleRowRaw, "hovering the ▼ indicator should brighten its foreground style");
+			// Moving pointer to editor row (outside scrollview) restores exact idle row
+			f.emit(35, 0, f.terminal.rows - 1);
+			f.render();
+			assert.equal(f.tui.getScreenLines()[rect.row], idleRowRaw);
+			// Clicking inside the 3-col hit rect scrolls to bottom and re-enables follow mode
 			f.emit(0, rect.column + 1, rect.row);
 			f.emit(0, rect.column + 1, rect.row, "m");
 			f.render();

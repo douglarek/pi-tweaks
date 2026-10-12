@@ -255,13 +255,13 @@ export default function (pi) {
         assert session.read_bytes() == before_jump, 'keyboard navigation changed the session'
         send('/question-nav 1\r')
         wait_for(lambda: row_with('Hover smoke test') is not None and row_with('Hover smoke test') <= 3, 'first question not located')
-        wait_for(lambda: row_with('↓') is not None, 'minimal jump-to-end arrow did not appear')
+        wait_for(lambda: row_with('▼') is not None, 'minimal jump-to-end arrow did not appear')
         assert row_with('Jump to latest message') is None, 'verbose jump banner remains visible'
-        arrow_row = row_with('↓')
-        arrow_column = screen()[arrow_row].index('↓') + 1
+        arrow_row = row_with('▼')
+        arrow_column = screen()[arrow_row].index('▼') + 1
         mouse(0, arrow_column, arrow_row)
         mouse(0, arrow_column, arrow_row, 'm')
-        wait_for(lambda: row_with('PTY_FINAL_REPLY') is not None and row_with('↓') is None,
+        wait_for(lambda: row_with('PTY_FINAL_REPLY') is not None and row_with('▼') is None,
                  'arrow click did not restore follow-end scrolling')
         assert session.read_bytes() == before_jump
         print('PASS: compact arrow replaces the verbose banner and still jumps to the latest message.')

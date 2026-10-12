@@ -29,7 +29,7 @@ Native tool shells drop their extra top/bottom padding while keeping a single bl
 
 ### Minimal jump-to-latest indicator
 
-When browsing earlier messages, the verbose jump-to-latest banner becomes a small clickable `↓`. Clicking it or pressing `Ctrl+End` still returns to the latest message and resumes follow-end scrolling.
+When browsing earlier messages, the verbose jump-to-latest banner becomes a compact clickable `▼` (matching `grok-build`'s `draw_scroll_arrow`, brightening on mouse hover and hiding when an overlay or search bar is active). Clicking its 3-column hit area or pressing `Ctrl+End` returns to the latest message and resumes follow-end scrolling.
 
 ![A compact down arrow above the editor while reviewing earlier messages, with an unsent draft preserved.](docs/images/jump-to-latest.png)
 

@@ -66,6 +66,7 @@ interface HoverTUI extends TUI {
 	doRender(): void;
 	layoutRoot?: Component;
 	scrollToEndIndicator?: () => string;
+	scrollToEndIndicatorRect?: { row: number; column: number; width: number };
 	selectionPressActive?: boolean;
 	mouseCapture?: unknown;
 	mousePressTarget?: unknown;
@@ -357,13 +358,41 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		return hit ? `${hit.kind}:${hit.index ?? "disabled"}` : "";
 	}
 	function getBox(layout = ui.currentLayout): LayoutBox | undefined {
-		if (!framesEnabled() || !pointer || !layout?.root || ui.hasOverlay() || ui.hasActiveSelection()) return undefined;
+		if (!framesEnabled() || !pointer || !layout?.root || ui.hasOverlay() || ui.hasActiveSelection() ||
+			isIndicatorHovered(layout)) return undefined;
 		const chat = transcriptContainer(layout);
 		return chat ? hoveredChatEntry(layout.root, pointer, chat) : undefined;
 	}
 
 	function getBoxKey(box = getBox()): string {
 		return box ? `${box.rect.y}:${box.rect.height}` : "";
+	}
+	function findScrollViewBox(box: LayoutBox, target: Component): LayoutBox | undefined {
+		if (box.component === target) return box;
+		for (const child of box.children) {
+			const found = findScrollViewBox(child, target);
+			if (found) return found;
+		}
+		return undefined;
+	}
+	function indicatorRect(layout = ui.currentLayout): { row: number; column: number; width: number } | undefined {
+		if (disposed || !layout?.root || ui.hasOverlay() || ui.activeSearch) return undefined;
+		const scrollView = layout.primaryScrollView as (ChatScrollView & { followEnd?: boolean }) | undefined;
+		if (!scrollView || scrollView.followEnd === false || scrollView.isFollowingEnd) return undefined;
+		const box = findScrollViewBox(layout.root, scrollView);
+		const clip = box?.clip;
+		if (!clip || clip.width < 3 || clip.height <= 0) return undefined;
+		return {
+			row: clip.y + clip.height - 1,
+			column: clip.x + Math.floor((clip.width - 3) / 2),
+			width: 3,
+		};
+	}
+	function isIndicatorHovered(layout = ui.currentLayout): boolean {
+		if (!pointer || nativeGesture()) return false;
+		const rect = indicatorRect(layout) ?? ui.scrollToEndIndicatorRect;
+		if (!rect) return false;
+		return pointer.y === rect.row && pointer.x >= rect.column && pointer.x < rect.column + rect.width;
 	}
 
 	const patchedInput = function (this: HoverTUI, data: string): unknown {
@@ -373,8 +402,10 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		const previousSelected = selectedQuestion;
 		const previousHit = navHoverKey();
 		const previousFooterHover = footerController.isHovered();
+		const previousIndicatorHover = isIndicatorHovered();
 		if (data === "\x1b[O") {
-			if (footerController.setHovered(false)) ui.requestRender();
+			pointer = undefined;
+			if (footerController.setHovered(false) || previousIndicatorHover) ui.requestRender();
 		}
 		const mouse = MOUSE_MOVE.exec(data);
 		if (!mouse && suggestionsEnabled() && !ui.hasOverlay()) {
@@ -442,10 +473,12 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		const result = originalInput.call(this, data);
 		if (oldTop !== scroll?.scrollTop || (button & 64) !== 0) selectedQuestion = undefined;
 		if (previous !== getBox()?.component || previousBoxKey !== getBoxKey() || previousHit !== navHoverKey() ||
-			previousSelected !== selectedQuestion || previousFooterHover !== footerController.isHovered()) ui.requestRender();
+			previousSelected !== selectedQuestion || previousFooterHover !== footerController.isHovered() ||
+			previousIndicatorHover !== isIndicatorHovered()) ui.requestRender();
 		return result;
 	};
 
+	let paintingLayout: LayoutFrame | undefined;
 	const patchedPaint = function (this: HoverTUI, screen: string[], layout: LayoutFrame, width: number): string[] {
 		const hovered = disposed ? undefined : getBox(layout);
 		const target = !disposed && framesEnabled() && selectedQuestion && !ui.hasOverlay() && !ui.hasActiveSelection()
@@ -473,7 +506,13 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 			}
 		}
 		// Screen-only chrome: native copy uses the unchanged document, never these decorations.
-		const result = originalPaint.call(this, decorated, layout, width);
+		paintingLayout = layout;
+		let result: string[];
+		try {
+			result = originalPaint.call(this, decorated, layout, width);
+		} finally {
+			paintingLayout = undefined;
+		}
 		lastRail = disposed ? undefined : navigationRail(layout, width);
 		let finalScreen = lastRail ? paintQuestionNavigation(result, lastRail, getTheme(), width,
 			ui.hasOverlay() || nativeGesture() ? undefined : pointer, !ui.hasActiveSelection()) : result;
@@ -491,7 +530,12 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		}
 		originalRender.call(this);
 	};
-	const minimalIndicator = () => disposed ? originalIndicator?.() ?? "" : getTheme().fg("muted", " ↓ ");
+	const minimalIndicator = () => {
+		if (disposed) return originalIndicator?.() ?? "";
+		if (ui.hasOverlay() || ui.activeSearch) return "";
+		const hovered = isIndicatorHovered(paintingLayout ?? ui.currentLayout);
+		return getTheme().fg(hovered ? "text" : "muted", " ▼ ");
+	};
 	if (typeof originalIndicator === "function") {
 		Object.defineProperty(ui, "scrollToEndIndicator", { configurable: true, writable: true, value: minimalIndicator });
 	}
