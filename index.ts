@@ -415,10 +415,8 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 		if (data === "\x1b[O") {
 			pointer = undefined;
 			if (footerController.setHovered(false) || previousIndicatorHover) ui.requestRender();
-			options.onTerminalInput?.(data);
-		} else if (data === "\x1b[I") {
-			options.onTerminalInput?.(data);
 		}
+		options.onTerminalInput?.(data);
 		const mouse = MOUSE_MOVE.exec(data);
 		if (!mouse && suggestionsEnabled() && !ui.hasOverlay()) {
 			const outcome = handlePromptSuggestionInput(data, ui.currentLayout, suggestionState, () => ui.requestRender());
@@ -692,9 +690,13 @@ export default function piTweaks(pi: ExtensionAPI): void {
 			const result = await ctx.modelRegistry.complete(
 				model,
 				{
+					systemPrompt,
 					messages: [
-						{ role: "system", content: systemPrompt },
-						{ role: "user", content: userPrompt },
+						{
+							role: "user",
+							content: [{ type: "text", text: userPrompt }],
+							timestamp: Date.now(),
+						},
 					],
 				},
 				{ maxTokens: 48, temperature: 0.2 },

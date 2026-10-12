@@ -97,6 +97,32 @@ function unwrapEntryMessage(entry: unknown): { role?: string; content?: unknown 
 	return undefined;
 }
 
+export function extractLastEntryTimestamp(entries: unknown[]): number {
+	if (!Array.isArray(entries) || entries.length === 0) return 0;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (!entry || typeof entry !== "object") continue;
+		const rec = entry as {
+			timestamp?: unknown;
+			message?: { timestamp?: unknown };
+			data?: { timestamp?: unknown };
+		};
+		if (typeof rec.message?.timestamp === "number" && Number.isFinite(rec.message.timestamp)) {
+			return rec.message.timestamp;
+		}
+		if (typeof rec.data?.timestamp === "number" && Number.isFinite(rec.data.timestamp)) {
+			return rec.data.timestamp;
+		}
+		if (typeof rec.timestamp === "number" && Number.isFinite(rec.timestamp)) {
+			return rec.timestamp;
+		}
+		if (typeof rec.timestamp === "string") {
+			const parsed = Date.parse(rec.timestamp);
+			if (!Number.isNaN(parsed)) return parsed;
+		}
+	}
+	return 0;
+}
 export function keepHead(text: string, maxChars: number): string {
 	const chars = Array.from(text);
 	if (chars.length <= maxChars) return text;
@@ -452,6 +478,7 @@ export function createRecapController(
 	const focusTracker = new FocusTracker(minIdleMs, retryIntervalMs);
 	let activeCtx: ExtensionContext | undefined;
 	let lastTurnEndAt = 0;
+	let lastInputAt = 0;
 	let lastRecapMainTurn = 0;
 	let recapEpoch = 0;
 	let recapInFlight = false;
@@ -505,12 +532,16 @@ export function createRecapController(
 			const result = await ctx.modelRegistry.complete(
 				model,
 				{
+					systemPrompt: RECAP_SYSTEM,
 					messages: [
-						{ role: "system", content: RECAP_SYSTEM },
-						{ role: "user", content: transcript },
+						{
+							role: "user",
+							content: [{ type: "text", text: transcript }],
+							timestamp: now,
+						},
 					],
 				},
-				{ maxTokens: 120, temperature: 0.2 },
+				{ maxTokens: 256, temperature: 0.2 },
 			);
 
 			let raw = "";
@@ -574,7 +605,13 @@ export function createRecapController(
 		stopPolling();
 		if (pollIntervalMs <= 0) return;
 		pollTimer = setInterval(() => {
-			if (focusTracker.recapDue(nowFn()) && isEligibleForAutoRecap()) {
+			const now = nowFn();
+			const inputIdleDue =
+				lastInputAt > 0 &&
+				now - lastInputAt >= minIdleMs &&
+				lastTurnEndAt > 0 &&
+				now - lastTurnEndAt >= minIdleMs;
+			if ((focusTracker.recapDue(now) || inputIdleDue) && isEligibleForAutoRecap()) {
 				void handleAutoRecap();
 			}
 		}, pollIntervalMs);
@@ -597,18 +634,34 @@ export function createRecapController(
 			focusTracker.onFocusGained();
 			const entries = ctx.sessionManager?.getEntries?.() ?? [];
 			lastRecapMainTurn = 0;
-			syncWatermark(entries);
-			lastTurnEndAt = entries.length > 0 ? nowFn() : 0;
+			const mainTurns = syncWatermark(entries);
+			const now = nowFn();
+			lastInputAt = now;
+			const persistedTs = extractLastEntryTimestamp(entries);
+			lastTurnEndAt = persistedTs > 0 ? persistedTs : entries.length > 0 ? now : 0;
 			startPolling();
+			// If attaching/resuming a session that has already been idle >= minIdleMs with >= 3 turns,
+			// generate the "where was I" recap immediately on session load.
+			if (
+				persistedTs > 0 &&
+				now - persistedTs >= minIdleMs &&
+				mainTurns >= MIN_TURNS_FOR_AUTO_RECAP &&
+				mainTurns > lastRecapMainTurn
+			) {
+				void handleAutoRecap();
+			}
 		},
 		onTurnSettled(ctx: ExtensionContext) {
 			activeCtx = ctx;
 			const entries = ctx.sessionManager?.getEntries?.() ?? [];
 			syncWatermark(entries);
-			lastTurnEndAt = nowFn();
+			const now = nowFn();
+			lastTurnEndAt = now;
+			lastInputAt = now;
 		},
 		onNewPrompt() {
 			recapEpoch++;
+			lastInputAt = nowFn();
 		},
 		onTerminalInput(data: string) {
 			const now = nowFn();
@@ -617,9 +670,12 @@ export function createRecapController(
 			} else if (data === "\x1b[I") {
 				const due = focusTracker.recapDue(now);
 				focusTracker.onFocusGained();
+				lastInputAt = now;
 				if (due && isEligibleForAutoRecap()) {
 					void handleAutoRecap();
 				}
+			} else {
+				lastInputAt = now;
 			}
 		},
 		triggerAutoRecap() {
