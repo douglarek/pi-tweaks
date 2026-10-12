@@ -440,6 +440,14 @@ export async function executeSessionSwitch(
 	return false;
 }
 
+function safeNotify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
+	try {
+		ctx.ui.notify(message, type);
+	} catch {
+		// Ignore stale ctx after session replacement
+	}
+}
+
 /** Create a new session in target directory and switch to it */
 export async function createAndSwitchNewSession(
 	targetDir: string,
@@ -469,11 +477,11 @@ export async function createAndSwitchNewSession(
 
 		const switched = await executeSessionSwitch(sessionFile, resolvedTarget, tui);
 		if (switched) {
-			ctx.ui.notify(`Started new session in ${displayPath(resolvedTarget)}`, "info");
+			safeNotify(ctx, `Started new session in ${displayPath(resolvedTarget)}`, "info");
 			return true;
 		}
 	} catch (err) {
-		ctx.ui.notify(`Failed to start session in ${displayPath(resolvedTarget)}: ${err instanceof Error ? err.message : String(err)}`, "error");
+		safeNotify(ctx, `Failed to start session in ${displayPath(resolvedTarget)}: ${err instanceof Error ? err.message : String(err)}`, "error");
 	}
 	return false;
 }
@@ -1667,9 +1675,9 @@ export async function handleTargetDirectorySelection(
 	} else if (choice.action === "attach" && choice.session) {
 		const switched = await executeSessionSwitch(choice.session.path, resolvedTarget, activeTuiRef ?? tui);
 		if (switched) {
-			ctx.ui.notify(`Switched to session in ${displayPath(resolvedTarget)}`, "info");
+			safeNotify(ctx, `Switched to session in ${displayPath(resolvedTarget)}`, "info");
 		} else {
-			ctx.ui.notify(`Failed to switch session in ${displayPath(resolvedTarget)}`, "error");
+			safeNotify(ctx, `Failed to switch session in ${displayPath(resolvedTarget)}`, "error");
 		}
 	}
 }
@@ -1749,9 +1757,9 @@ async function executeDashboardResult(
 		const targetCwd = result.selectedDir || targetSession.cwd;
 		const switched = await executeSessionSwitch(targetSession.path, targetCwd, activeTuiRef);
 		if (switched) {
-			ctx.ui.notify(`Switched to session in ${displayPath(targetCwd)}`, "info");
+			safeNotify(ctx, `Switched to session in ${displayPath(targetCwd)}`, "info");
 		} else {
-			ctx.ui.notify(`Failed to switch to session: ${displayPath(targetSession.path)}`, "error");
+			safeNotify(ctx, `Failed to switch to session: ${displayPath(targetSession.path)}`, "error");
 		}
 	}
 }

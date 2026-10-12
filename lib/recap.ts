@@ -460,11 +460,12 @@ export interface RecapOptions {
 	retryIntervalMs?: number;
 	now?: () => number;
 	getChatContainer?: () => Container | undefined;
+	getTheme?: () => Theme | undefined;
 }
 
 export interface RecapController {
 	readonly focusTracker: FocusTracker;
-	onSessionStart(ctx: ExtensionContext, reason?: string): void;
+	onSessionStart(ctx: ExtensionContext): void;
 	onTurnSettled(ctx: ExtensionContext): void;
 	onNewPrompt(): void;
 	onTerminalInput(data: string): void;
@@ -488,24 +489,18 @@ export function createRecapController(
 
 	const focusTracker = new FocusTracker(minIdleMs, retryIntervalMs);
 	let activeCtx: ExtensionContext | undefined;
+	let cachedTheme: Theme | undefined;
 	let lastTurnEndAt = 0;
-	let lastInputAt = 0;
 	let lastRecapMainTurn = 0;
 	let recapEpoch = 0;
 	let recapInFlight = false;
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
-	let startupTimer: ReturnType<typeof setTimeout> | undefined;
-	let pendingMount: { parent: Container; wrapper: Container } | undefined;
 
 	function currentSessionKey(ctx: ExtensionContext | undefined = activeCtx): string {
-		return ctx?.sessionManager?.getSessionFile?.() ?? "__default__";
-	}
-
-	function clearPendingMount(): void {
-		if (pendingMount) {
-			pendingMount.parent.removeChild(pendingMount.wrapper);
-			pendingMount = undefined;
-			onRequestRender();
+		try {
+			return ctx?.sessionManager?.getSessionFile?.() ?? "__default__";
+		} catch {
+			return "__default__";
 		}
 	}
 
@@ -529,42 +524,55 @@ export function createRecapController(
 	}
 
 	function isEligibleForAutoRecap(): boolean {
-		if (!isEnabled() || !activeCtx || !activeCtx.hasUI || activeCtx.mode !== "tui") return false;
-		if (!activeCtx.isIdle() || activeCtx.hasPendingMessages() || getOverlayState()) return false;
-		if (!activeCtx.model || !activeCtx.modelRegistry) return false;
-		return true;
+		try {
+			if (!isEnabled() || !activeCtx || !activeCtx.hasUI || activeCtx.mode !== "tui") return false;
+			if (!activeCtx.isIdle() || activeCtx.hasPendingMessages() || getOverlayState()) return false;
+			if (!activeCtx.model || !activeCtx.modelRegistry) return false;
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
-	async function handleAutoRecap(bypassIdleGate = false): Promise<boolean> {
+	async function handleAutoRecap(): Promise<boolean> {
 		if (!isEligibleForAutoRecap() || !activeCtx) return false;
 		const ctx = activeCtx;
 		const epoch = recapEpoch;
-		const entries = ctx.sessionManager.getEntries();
+		let entries: unknown[];
+		try {
+			entries = ctx.sessionManager.getEntries();
+		} catch {
+			return false;
+		}
 		const mainTurns = syncWatermark(entries);
 
 		const now = nowFn();
 		const idleMs = lastTurnEndAt > 0 ? now - lastTurnEndAt : 0;
-		const idleOk = bypassIdleGate || (lastTurnEndAt > 0 && idleMs >= minIdleMs);
+		const idleOk = lastTurnEndAt > 0 && idleMs >= minIdleMs;
 
-		if (bypassIdleGate) {
-			if (mainTurns === 0 || mainTurns <= lastRecapMainTurn) return false;
-		} else {
-			const gate = recapGate(mainTurns, lastRecapMainTurn, true, idleOk);
-			if (!gate.ok) return false;
-		}
+		const gate = recapGate(mainTurns, lastRecapMainTurn, true, idleOk);
+		if (!gate.ok) return false;
 		if (recapInFlight) return false;
 
 		const transcript = buildRecapTranscript(entries);
 		if (!transcript) return false;
 
-		const model = ctx.model;
-		if (!model || !ctx.modelRegistry) return false;
+		let model: ExtensionContext["model"];
+		let modelRegistry: ExtensionContext["modelRegistry"];
+		try {
+			model = ctx.model;
+			modelRegistry = ctx.modelRegistry;
+			cachedTheme = options.getTheme?.() ?? ctx.ui?.theme ?? cachedTheme;
+		} catch {
+			return false;
+		}
+		if (!model || !modelRegistry) return false;
 
 		recapInFlight = true;
 		focusTracker.noteAutoRecapAttempt(now);
 
 		try {
-			const result = await ctx.modelRegistry.complete(
+			const result = await modelRegistry.complete(
 				model,
 				{
 					systemPrompt: RECAP_SYSTEM,
@@ -601,7 +609,7 @@ export function createRecapController(
 				return false;
 			}
 
-			// Cancelled by a new user prompt while generating
+			// Cancelled by a new user prompt or session switch while generating
 			if (recapEpoch !== epoch) {
 				recapInFlight = false;
 				return false;
@@ -620,8 +628,9 @@ export function createRecapController(
 			focusTracker.markRecapShown();
 
 			const chatContainer = options.getChatContainer?.();
-			if (chatContainer) {
-				const liveView = new RecapEntryView(summary, () => ctx.ui.theme, false, 1, onRequestRender);
+			const themeToUse = options.getTheme?.() ?? cachedTheme;
+			if (chatContainer && themeToUse) {
+				const liveView = new RecapEntryView(summary, () => options.getTheme?.() ?? themeToUse, false, 1, onRequestRender);
 				const liveWrapper = new Container();
 				liveWrapper.addChild(new Spacer(1));
 				liveWrapper.addChild(liveView);
@@ -651,14 +660,8 @@ export function createRecapController(
 		stopPolling();
 		if (pollIntervalMs <= 0) return;
 		pollTimer = setInterval(() => {
-			const now = nowFn();
-			const inputIdleDue =
-				lastInputAt > 0 &&
-				now - lastInputAt >= minIdleMs &&
-				lastTurnEndAt > 0 &&
-				now - lastTurnEndAt >= minIdleMs;
-			if ((focusTracker.recapDue(now) || inputIdleDue) && isEligibleForAutoRecap()) {
-				void handleAutoRecap(false);
+			if (focusTracker.recapDue(nowFn()) && isEligibleForAutoRecap()) {
+				void handleAutoRecap();
 			}
 		}, pollIntervalMs);
 		pollTimer.unref?.();
@@ -669,55 +672,39 @@ export function createRecapController(
 			clearInterval(pollTimer);
 			pollTimer = undefined;
 		}
-		if (startupTimer) {
-			clearTimeout(startupTimer);
-			startupTimer = undefined;
-		}
 	}
 
 	return {
 		focusTracker,
-		onSessionStart(ctx: ExtensionContext, reason?: string) {
+		onSessionStart(ctx: ExtensionContext) {
 			activeCtx = ctx;
 			recapEpoch++;
 			recapInFlight = false;
-			clearPendingMount();
 			focusTracker.onFocusGained();
-			const entries = ctx.sessionManager?.getEntries?.() ?? [];
-			lastRecapMainTurn = 0;
-			const mainTurns = syncWatermark(entries);
-			const now = nowFn();
-			lastInputAt = now;
-			const persistedTs = extractLastEntryTimestamp(entries);
-			lastTurnEndAt = persistedTs > 0 ? persistedTs : entries.length > 0 ? now : 0;
-			startPolling();
-
-			const isResumedOrReloaded = reason === "resume" || reason === "reload";
-			const isIdleStartup =
-				persistedTs > 0 &&
-				now - persistedTs >= minIdleMs &&
-				mainTurns >= MIN_TURNS_FOR_AUTO_RECAP;
-			if ((isResumedOrReloaded && mainTurns >= 1 && mainTurns > lastRecapMainTurn) ||
-				(isIdleStartup && mainTurns > lastRecapMainTurn)) {
-				startupTimer = setTimeout(() => {
-					startupTimer = undefined;
-					void handleAutoRecap(isResumedOrReloaded);
-				}, 60);
-				startupTimer.unref?.();
+			try {
+				cachedTheme = options.getTheme?.() ?? ctx.ui?.theme ?? cachedTheme;
+				const entries = ctx.sessionManager?.getEntries?.() ?? [];
+				lastRecapMainTurn = 0;
+				syncWatermark(entries);
+				const persistedTs = extractLastEntryTimestamp(entries);
+				lastTurnEndAt = persistedTs > 0 ? persistedTs : entries.length > 0 ? nowFn() : 0;
+			} catch {
+				lastTurnEndAt = 0;
 			}
+			startPolling();
 		},
 		onTurnSettled(ctx: ExtensionContext) {
 			activeCtx = ctx;
-			const entries = ctx.sessionManager?.getEntries?.() ?? [];
-			syncWatermark(entries);
-			const now = nowFn();
-			lastTurnEndAt = now;
-			lastInputAt = now;
+			try {
+				const entries = ctx.sessionManager?.getEntries?.() ?? [];
+				syncWatermark(entries);
+			} catch {
+				// ignore stale ctx
+			}
+			lastTurnEndAt = nowFn();
 		},
 		onNewPrompt() {
 			recapEpoch++;
-			clearPendingMount();
-			lastInputAt = nowFn();
 		},
 		onTerminalInput(data: string) {
 			const now = nowFn();
@@ -726,20 +713,16 @@ export function createRecapController(
 			} else if (data === "\x1b[I") {
 				const due = focusTracker.recapDue(now);
 				focusTracker.onFocusGained();
-				lastInputAt = now;
 				if (due && isEligibleForAutoRecap()) {
-					void handleAutoRecap(false);
+					void handleAutoRecap();
 				}
-			} else {
-				lastInputAt = now;
 			}
 		},
 		triggerAutoRecap() {
-			return handleAutoRecap(false);
+			return handleAutoRecap();
 		},
 		dispose() {
 			stopPolling();
-			clearPendingMount();
 			recapEpoch++;
 			recapInFlight = false;
 			activeCtx = undefined;

@@ -622,12 +622,14 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 
 export default function piTweaks(pi: ExtensionAPI): void {
 	let detach: PiTweaksController | undefined;
+	let activeTheme: Theme | undefined;
 	const recap = createRecapController(
 		pi,
 		() => detach?.hasOverlay?.() ?? false,
 		() => detach?.requestRender?.(),
 		{
 			getChatContainer: () => detach?.getChatContainer?.(),
+			getTheme: () => activeTheme,
 		},
 	);
 	function remove(): void {
@@ -636,20 +638,29 @@ export default function piTweaks(pi: ExtensionAPI): void {
 		detach = undefined;
 	}
 	pi.registerEntryRenderer?.<RecapEntryData>(RECAP_ENTRY_TYPE, (entry, options, theme) => {
+		activeTheme = theme;
 		const summary = entry.data?.summary?.trim();
 		if (!summary) return undefined;
-		return new RecapEntryView(summary, () => theme, options.expanded, 1, () => detach?.requestRender?.());
+		return new RecapEntryView(summary, () => activeTheme ?? theme, options.expanded, 1, () => detach?.requestRender?.());
 	});
-	pi.on("session_start", (event, ctx) => {
+	pi.on("session_start", (_event, ctx) => {
 		remove();
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
-		ctx.ui.setWidget(WIDGET_KEY, (tui) => {
+		activeTheme = ctx.ui.theme;
+		ctx.ui.setWidget(WIDGET_KEY, (tui, widgetTheme) => {
+			if (widgetTheme) activeTheme = widgetTheme;
 			if (tui.mode === "fullscreen") {
 				try {
-					detach = installPiTweaks(tui, () => ctx.ui.theme, {
+					detach = installPiTweaks(tui, () => {
+						try {
+							return ctx.ui.theme ?? activeTheme!;
+						} catch {
+							return activeTheme!;
+						}
+					}, {
 						onTerminalInput: (data) => recap.onTerminalInput(data),
 					});
-					recap.onSessionStart(ctx, (event as { reason?: string } | undefined)?.reason);
+					recap.onSessionStart(ctx);
 				} catch (error) {
 					ctx.ui.notify(`pi-tweaks could not attach: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
