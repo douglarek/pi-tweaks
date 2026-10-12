@@ -356,10 +356,9 @@ export class FocusTracker {
 }
 
 /**
- * Render component for a `Recap` entry, matching `SessionEventBlock::recap_output` in `grok-build`:
- * - Loading state (`summary === ""`): shows `Recap` header only.
- * - Expanded by default: bold "Recap" header + blank line + wrapped muted summary body.
- * - Clickable to toggle into single-line collapsed preview: `Recap  <first-line preview>`.
+ * Render component for a `Recap` entry, matching `grok-build` screenshot:
+ * - Collapsed by default (single line): ` ◆ Recap  <first-line preview>...` in dim style.
+ * - Clickable to toggle into Expanded multi-line view.
  */
 export class RecapEntryView implements Component {
 	private summary: string;
@@ -405,42 +404,34 @@ export class RecapEntryView implements Component {
 		return this.summary;
 	}
 
-	isCollapsed(_hostExpanded = false): boolean {
+	isCollapsed(hostExpanded = false): boolean {
 		if (this.collapsedOverride !== undefined) return this.collapsedOverride;
-		return false;
+		return !hostExpanded;
 	}
 
 	private renderInner(width: number, hostExpanded: boolean): string[] {
 		const th = this.getTheme();
 		const pad = " ".repeat(Math.max(1, this.outputPad));
 		const contentWidth = Math.max(20, width - pad.length * 2);
+		const cleanBody = this.summary.trim();
+		if (!cleanBody) return [];
 
-		// In-flight loading state (empty summary): header only, matching grok-build `session_event.rs:649`
-		if (!this.summary.trim()) {
-			const loadingHeader = `${pad}${th.fg("muted", th.bold("Recap"))}`;
-			const vis = visibleWidth(loadingHeader);
-			return [loadingHeader + " ".repeat(Math.max(0, width - vis))];
-		}
-
+		const bullet = th.fg("muted", "◆ ");
+		const header = th.fg("dim", th.bold("Recap"));
 		const collapsed = this.isCollapsed(hostExpanded);
 
 		if (collapsed) {
-			const header = th.fg("muted", th.bold("Recap"));
-			const preview = (this.summary.split("\n")[0] ?? this.summary).trim();
-			const body = preview ? th.fg("muted", `  ${preview}`) : "";
-			const line = truncateToWidth(`${pad}${header}${body}`, width, th.fg("muted", "\u2026"));
+			const preview = (cleanBody.split("\n")[0] ?? cleanBody).trim();
+			const body = preview ? th.fg("dim", `  ${preview}`) : "";
+			const line = truncateToWidth(`${pad}${bullet}${header}${body}`, width, th.fg("dim", "..."));
 			const lineVis = visibleWidth(line);
 			return [line + " ".repeat(Math.max(0, width - lineVis))];
 		}
 
-		const headerLine = `${pad}${th.fg("text", th.bold("Recap"))}`;
-		const headerVis = visibleWidth(headerLine);
-		const lines: string[] = [
-			headerLine + " ".repeat(Math.max(0, width - headerVis)),
-			" ".repeat(width),
-		];
-
-		const wrapped = wrapTextWithAnsi(th.fg("muted", this.summary), contentWidth);
+		// Expanded: wraps "◆ Recap  <summary>" across lines
+		const inlineText = `${bullet}${header}${th.fg("dim", `  ${cleanBody}`)}`;
+		const wrapped = wrapTextWithAnsi(inlineText, contentWidth);
+		const lines: string[] = [];
 		for (const wLine of wrapped) {
 			const full = `${pad}${wLine}`;
 			const vis = visibleWidth(full);
@@ -572,20 +563,6 @@ export function createRecapController(
 		recapInFlight = true;
 		focusTracker.noteAutoRecapAttempt(now);
 
-		// Mount an in-flight loading Recap block in chatContainer if available
-		const chatContainer = options.getChatContainer?.();
-		let liveView: RecapEntryView | undefined;
-		let liveWrapper: Container | undefined;
-		if (chatContainer) {
-			liveView = new RecapEntryView("", () => ctx.ui.theme, false, 1, onRequestRender);
-			liveWrapper = new Container();
-			liveWrapper.addChild(new Spacer(1));
-			liveWrapper.addChild(liveView);
-			chatContainer.addChild(liveWrapper);
-			pendingMount = { parent: chatContainer, wrapper: liveWrapper };
-			onRequestRender();
-		}
-
 		try {
 			const result = await ctx.modelRegistry.complete(
 				model,
@@ -621,14 +598,12 @@ export function createRecapController(
 			const summary = cleanRecapText(raw);
 			if (!summary) {
 				recapInFlight = false;
-				clearPendingMount();
 				return false;
 			}
 
 			// Cancelled by a new user prompt while generating
 			if (recapEpoch !== epoch) {
 				recapInFlight = false;
-				clearPendingMount();
 				return false;
 			}
 
@@ -637,7 +612,6 @@ export function createRecapController(
 				commitWatermark(mainTurns);
 				recapInFlight = false;
 				focusTracker.markRecapShown();
-				clearPendingMount();
 				return false;
 			}
 
@@ -645,9 +619,13 @@ export function createRecapController(
 			recapInFlight = false;
 			focusTracker.markRecapShown();
 
-			if (liveView && liveWrapper) {
-				pendingMount = undefined;
-				liveView.setSummary(summary);
+			const chatContainer = options.getChatContainer?.();
+			if (chatContainer) {
+				const liveView = new RecapEntryView(summary, () => ctx.ui.theme, false, 1, onRequestRender);
+				const liveWrapper = new Container();
+				liveWrapper.addChild(new Spacer(1));
+				liveWrapper.addChild(liveView);
+				chatContainer.addChild(liveWrapper);
 				onRequestRender();
 				return true;
 			}
@@ -665,7 +643,6 @@ export function createRecapController(
 			return true;
 		} catch {
 			recapInFlight = false;
-			clearPendingMount();
 			return false;
 		}
 	}

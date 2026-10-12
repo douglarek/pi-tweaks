@@ -1600,7 +1600,7 @@ test("pi-tweaks regression suite", async (t) => {
 			assert.equal(await controller.triggerAutoRecap(), false);
 			assert.equal(appended.length, 1);
 
-			// Test RecapEntryView rendering (Expanded by default, click toggles to Collapsed)
+			// Test RecapEntryView rendering (Collapsed single-line by default, click toggles to Expanded)
 			let viewRenders = 0;
 			const view = new RecapEntryView(
 				appended[0].data.summary,
@@ -1609,18 +1609,18 @@ test("pi-tweaks regression suite", async (t) => {
 				1,
 				() => { viewRenders++; },
 			);
-			const expandedLines = view.render(60).map(stripTerminalSequences);
-			assert.ok(expandedLines.length >= 3, "expanded recap has header + blank + body");
-			assert.equal(expandedLines[0].trim(), "Recap");
-			assert.ok(expandedLines.slice(2).join(" ").includes("We fixed the location picker"));
-
-			// Click to collapse into a single preview line
-			view.handleMouse({ type: "click", button: "left", row: 0, col: 2 });
 			assert.equal(view.isCollapsed(), true);
-			assert.equal(viewRenders, 1);
-			const collapsedLines = view.render(60).map(stripTerminalSequences);
+			const collapsedLines = view.render(50).map(stripTerminalSequences);
 			assert.equal(collapsedLines.length, 1, "collapsed recap is a single line");
-			assert.ok(collapsedLines[0].includes("Recap  We fixed the location picker"));
+			assert.ok(collapsedLines[0].includes("◆ Recap  We fixed the location picker"));
+
+			// Click to expand into multi-line wrapped view
+			view.handleMouse({ type: "click", button: "left", row: 0, col: 2 });
+			assert.equal(view.isCollapsed(), false);
+			assert.equal(viewRenders, 1);
+			const expandedLines = view.render(50).map(stripTerminalSequences);
+			assert.ok(expandedLines.length >= 2, "expanded recap wraps across lines");
+			assert.ok(expandedLines.join(" ").includes("aligned hover brackets with Mode B"));
 		} finally {
 			controller.dispose();
 		}
