@@ -36,6 +36,7 @@ import {
 	RECAP_ENTRY_TYPE,
 	type RecapEntryData,
 } from "./lib/recap.ts";
+import { installWebSearch } from "./lib/web-search.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
@@ -766,4 +767,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 
 	// Register Dashboard & Location Picker commands and shortcuts (Ctrl+L, Ctrl+\, /dashboard, /cd)
 	installDashboardCommands(pi);
+
+	// Register Antigravity Google Web Search tool (scoped to Gemini models with priority over DuckDuckGo)
+	installWebSearch(pi);
 }

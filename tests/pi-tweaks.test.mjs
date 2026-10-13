@@ -58,6 +58,8 @@ const {
 	RecapEntryView,
 	createRecapController,
 } = await jiti.import(fileURLToPath(new URL("../lib/recap.ts", import.meta.url)));
+const { isGeminiModel, syncWebSearchToolState, WEB_SEARCH_TOOL_NAME, installWebSearch, resolveModelEndpoint } =
+	await jiti.import(fileURLToPath(new URL("../lib/web-search.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
@@ -1624,5 +1626,113 @@ test("pi-tweaks regression suite", async (t) => {
 		} finally {
 			controller.dispose();
 		}
+	});
+
+	await t.test("web-search: isGeminiModel and syncWebSearchToolState scope tools to Gemini and GPT series", () => {
+		assert.equal(isGeminiModel({ id: "gemini-3.8-flash-high" }), true);
+		assert.equal(isGeminiModel({ id: "gemini-2.5-pro" }), true);
+		assert.equal(isGeminiModel({ name: "Google: Gemini 3 Flash" }), true);
+		assert.equal(isGeminiModel({ id: "gpt-6-luna" }), true);
+		assert.equal(isGeminiModel({ id: "gpt-5.5" }), true);
+		assert.equal(isGeminiModel({ id: "grok-4.7" }), false);
+		assert.equal(isGeminiModel({ id: "claude-3-7-sonnet" }), false);
+		assert.equal(isGeminiModel(null), false);
+
+		let active = ["read", "bash", "edit", "write"];
+		const mockPi = {
+			getActiveTools: () => active,
+			setActiveTools: (tools) => { active = tools; },
+		};
+
+		// Non-gemini/non-gpt model (grok) does not activate web_search
+		syncWebSearchToolState(mockPi, { id: "grok-4.7" });
+		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), false);
+
+		// Gemini model activates web_search
+		syncWebSearchToolState(mockPi, { id: "gemini-3.8-flash-high" });
+		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), true);
+
+		// GPT model keeps web_search active
+		syncWebSearchToolState(mockPi, { id: "gpt-6-luna" });
+		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), true);
+
+		// Switching back to non-supported model removes web_search
+		syncWebSearchToolState(mockPi, { id: "grok-4.7" });
+		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), false);
+	});
+
+	await t.test("web-search: installWebSearch registers prioritized tool and rejects unsupported execution", async () => {
+		let registeredTool = null;
+		const handlers = new Map();
+		let active = ["read", "bash"];
+		const mockPi = {
+			registerTool: (tool) => { registeredTool = tool; },
+			on: (name, handler) => { handlers.set(name, handler); },
+			getActiveTools: () => active,
+			setActiveTools: (tools) => { active = tools; },
+		};
+
+		installWebSearch(mockPi);
+		assert.ok(registeredTool, "tool registered");
+		assert.equal(registeredTool.name, "web_search");
+		assert.equal(registeredTool.defaultActive, false);
+		assert.ok(registeredTool.promptGuidelines.some((g) => g.includes("ALWAYS prioritize using 'web_search'")), "priority guideline present");
+		assert.ok(registeredTool.promptGuidelines.some((g) => g.includes("DuckDuckGo")), "mentions priority over duckduckgo");
+
+		// Execute with unsupported model fails gracefully
+		const unsupportedRes = await registeredTool.execute("call_1", { query: "test" }, undefined, undefined, { model: { id: "grok-4.7" } });
+		assert.ok(unsupportedRes.content[0].text.includes("exclusively available for Gemini and GPT models"));
+
+		// session_start with Gemini model syncs tool
+		const sessionStartHandler = handlers.get("session_start");
+		sessionStartHandler({}, { model: { id: "gemini-3.8-flash-high" } });
+		assert.equal(active.includes("web_search"), true);
+
+		// session_start with GPT model syncs tool
+		sessionStartHandler({}, { model: { id: "gpt-6-luna" } });
+		assert.equal(active.includes("web_search"), true);
+
+		// model_select with non-supported model removes tool
+		const modelSelectHandler = handlers.get("model_select");
+		modelSelectHandler({ model: { id: "grok-4.7" } }, {});
+		assert.equal(active.includes("web_search"), false);
+
+		// Test renderCall and renderResult folding
+		const mockTheme = {
+			fg: (_color, text) => text,
+			bold: (text) => text,
+		};
+		const callComp = registeredTool.renderCall({ query: "java 27" }, mockTheme);
+		assert.ok(callComp.text.includes("java 27"));
+
+		const sampleResult = {
+			content: [{ type: "text", text: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6\nLine 7\nLine 8" }],
+			details: { query: "java 27", sourcesCount: 2 },
+		};
+		const collapsedComp = registeredTool.renderResult(sampleResult, { expanded: false, isPartial: false }, mockTheme);
+		assert.ok(collapsedComp.text.includes("ctrl+o to expand"), "collapsed output contains fold hint");
+		assert.ok(!collapsedComp.text.includes("Line 8"), "collapsed output omits line 8");
+
+		const expandedComp = registeredTool.renderResult(sampleResult, { expanded: true, isPartial: false }, mockTheme);
+		assert.ok(expandedComp.text.includes("Line 8"), "expanded output includes all lines");
+	});
+
+	await t.test("web-search: resolveModelEndpoint uses Pi native modelRegistry without child_process or file hacks", async () => {
+		const mockContext = {
+			model: { id: "gemini-3.8-flash-high", provider: "cpa" },
+			modelRegistry: {
+				getApiKeyAndHeaders: async (model) => ({
+					ok: true,
+					apiKey: "resolved-pi-key",
+					baseUrl: "https://custom-gateway.io/v1",
+					headers: { "x-custom": "header" },
+				}),
+				getProvider: (id) => ({ baseUrl: "https://fallback.io" }),
+			},
+		};
+		const resolved = await resolveModelEndpoint(mockContext);
+		assert.equal(resolved.apiKey, "resolved-pi-key");
+		assert.equal(resolved.baseUrl, "https://custom-gateway.io/v1");
+		assert.equal(resolved.headers["x-custom"], "header");
 	});
 });
