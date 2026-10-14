@@ -502,8 +502,10 @@ test("pi-tweaks regression suite", async (t) => {
 		try {
 			const unpatch = installAiHoverFrame(f.tui, () => theme);
 			assert.ok(f.terminal.writes.includes("\x1b[?1003h"));
+			assert.ok(f.terminal.writes.includes("\x1b[?1004h"));
 			unpatch();
 			assert.ok(f.terminal.writes.includes("\x1b[?1003l"));
+			assert.ok(f.terminal.writes.includes("\x1b[?1004l"));
 		} finally {
 			f.tui.stop();
 			if (old === undefined) delete process.env.TMUX; else process.env.TMUX = old;
@@ -1805,6 +1807,51 @@ test("pi-tweaks regression suite", async (t) => {
 			const settledCount = titles.length;
 			await new Promise((resolve) => setTimeout(resolve, 300));
 			assert.equal(titles.length, settledCount);
+		} finally {
+			controller.dispose();
+		}
+	});
+
+	await t.test("terminal-title: onAgentSettled emits notification only when terminal is unfocused", async () => {
+		const handlers = new Map();
+		const mockPi = {
+			on: (name, handler) => handlers.set(name, handler),
+			getSessionName: () => undefined,
+		};
+		let focused = true;
+		const controller = createTerminalTitleController(mockPi, {
+			isFocused: () => focused,
+		});
+		const notifications = [];
+		controller.setTerminalWriter((seq) => {
+			if (seq.includes("]9;") || seq.includes("]777;") || seq.includes("]99;")) {
+				notifications.push(seq);
+			}
+		});
+
+		try {
+			const ctx = { cwd: "/Users/admin/my-project", ui: { setTitle() {} } };
+			controller.onSessionStart(ctx);
+
+			// Turn 1: Terminal is focused -> notification must be suppressed
+			focused = true;
+			handlers.get("turn_start")({}, ctx);
+			handlers.get("tool_execution_start")({ toolName: "read", args: { path: "src/main.rs" } }, ctx);
+			handlers.get("tool_execution_end")({ toolName: "read" }, ctx);
+			controller.onAgentSettled(ctx);
+
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(notifications.length, 0, "must NOT emit notification while focused");
+
+			// Turn 2: Terminal is unfocused -> notification must be emitted
+			focused = false;
+			handlers.get("turn_start")({}, ctx);
+			handlers.get("tool_execution_start")({ toolName: "read", args: { path: "src/main.rs" } }, ctx);
+			handlers.get("tool_execution_end")({ toolName: "read" }, ctx);
+			controller.onAgentSettled(ctx);
+
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(notifications.length, 1, "must emit notification while unfocused");
 		} finally {
 			controller.dispose();
 		}

@@ -24,12 +24,21 @@ export const TITLE_SPINNER_FRAMES = [
 
 export const TITLE_SPINNER_INTERVAL_MS = 250;
 
+export interface TerminalTitleControllerOptions {
+	/**
+	 * Callback returning whether the terminal currently has focus.
+	 * When true, desktop completion notifications are suppressed (matching grok-build's NotificationCondition::Unfocused).
+	 */
+	isFocused?: () => boolean;
+}
+
 export interface TerminalTitleController {
 	dispose(): void;
 	onSessionStart(ctx: ExtensionContext): void;
 	onSessionShutdown(ctx?: ExtensionContext): void;
 	onAgentSettled(ctx?: ExtensionContext, aborted?: boolean): void;
 	setTerminalWriter(writer: ((seq: string) => void) | null): void;
+	setIsFocused(fn: (() => boolean) | null): void;
 	formatBaseTitle(cwd: string, sessionTopic?: string): string;
 	formatToolTitle(toolName: string, args: Record<string, any> | undefined, cwd: string, spinner?: string): string;
 	buildNotification(topic: string | undefined, dirName: string, metrics: TurnMetrics, aborted?: boolean): { title: string; body: string };
@@ -244,7 +253,10 @@ export function emitTerminalNotification(title: string, body: string, customWrit
 	return seq;
 }
 
-export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleController {
+export function createTerminalTitleController(
+	pi: ExtensionAPI,
+	options?: TerminalTitleControllerOptions,
+): TerminalTitleController {
 	let isDisposed = false;
 	let currentState: "idle" | "thinking" | "responding" | "tool" = "idle";
 	let currentTool: { toolName: string; args?: Record<string, any> } | null = null;
@@ -256,6 +268,7 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 	let spinnerFrameIndex = 0;
 	let activeContext: ExtensionContext | undefined;
 	let lastWrittenTitle = "";
+	let isFocusedFn = options?.isFocused ?? null;
 
 	function writeTitleEscape(title: string): void {
 		if (isDisposed) return;
@@ -457,7 +470,8 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 			const dirName = path.basename(cwd) || "workspace";
 			const topic = extractSessionTopic(ctx);
 			const metricsSnapshot = { ...turnMetrics, tools: [...turnMetrics.tools] };
-			const shouldNotify = !aborted && hadWorkInTurn;
+			const isFocused = typeof isFocusedFn === "function" ? isFocusedFn() : false;
+			const shouldNotify = !aborted && hadWorkInTurn && !isFocused;
 
 			resetTitle(ctx);
 
@@ -465,6 +479,8 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 				if (notifTimer) clearTimeout(notifTimer);
 				notifTimer = setTimeout(() => {
 					notifTimer = null;
+					const currentlyFocused = typeof isFocusedFn === "function" ? isFocusedFn() : false;
+					if (currentlyFocused) return;
 					const notif = buildNotification(topic, dirName, metricsSnapshot, Boolean(aborted));
 					emitTerminalNotification(notif.title, notif.body, terminalWriter);
 				}, 100);
@@ -475,6 +491,9 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 
 			hadWorkInTurn = false;
 			turnMetrics = { startTime: Date.now(), tools: [] };
+		},
+		setIsFocused(fn: (() => boolean) | null) {
+			isFocusedFn = fn;
 		},
 		formatBaseTitle,
 		formatToolTitle,

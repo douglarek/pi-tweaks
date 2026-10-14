@@ -716,6 +716,8 @@ export function createRecapController(
 				if (due && isEligibleForAutoRecap()) {
 					void handleAutoRecap();
 				}
+			} else if (!data.startsWith("\x1b[<")) {
+				focusTracker.onFocusGained();
 			}
 		},
 		triggerAutoRecap() {

@@ -30,7 +30,7 @@ Synchronizes the terminal window and tab title in real time with agent execution
 - **Thinking**: `⠋ Thinking... · <cwd>` (animated braille spinner cycling `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧`)
 - **Tool Execution**: `⠋ bash: <command> · <cwd>`, `⠋ read: <path> · <cwd>`, `⠋ edit: <path> · <cwd>`, `⠋ search: <query> · <cwd>`
 - **Responding**: `⠋ Responding... · <cwd>`
-- **Desktop Notifications**: Emits native notifications (OSC 777 / OSC 9) upon turn completion with session topic, explicit stop reason, and duration.
+- **Desktop Notifications**: Emits native notifications (OSC 777 / OSC 9) upon turn completion only when the terminal is unfocused (matching `grok-build`'s `NotificationCondition::Unfocused`, suppressed while actively focused inside the terminal). Includes session topic, explicit stop reason, and duration.
 
 ### Compact tool calls
 

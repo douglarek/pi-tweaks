@@ -556,6 +556,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 	Object.defineProperty(ui, "compositeScrollToEndIndicator", { configurable: true, writable: true, value: patchedPaint });
 	// Pi normally omits all-motion tracking in multiplexers; opt in only while this extension is active.
 	if (insideMux) ui.terminal.write("\x1b[?1003h");
+	ui.terminal.write("\x1b[?1004h");
 
 	const dispose = () => {
 		if (disposed) return;
@@ -585,6 +586,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 			else delete (ui as Partial<HoverTUI>).compositeScrollToEndIndicator;
 		}
 		if (insideMux) ui.terminal.write("\x1b[?1003l");
+		ui.terminal.write("\x1b[?1004l");
 		registerDashboardTui(null);
 		ui.requestRender();
 	};
@@ -624,7 +626,6 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 export default function piTweaks(pi: ExtensionAPI): void {
 	let detach: PiTweaksController | undefined;
 	let activeTheme: Theme | undefined;
-	const terminalTitle = createTerminalTitleController(pi);
 	const recap = createRecapController(
 		pi,
 		() => detach?.hasOverlay?.() ?? false,
@@ -634,6 +635,9 @@ export default function piTweaks(pi: ExtensionAPI): void {
 			getTheme: () => activeTheme,
 		},
 	);
+	const terminalTitle = createTerminalTitleController(pi, {
+		isFocused: () => recap.focusTracker.isFocused(),
+	});
 	function remove(): void {
 		recap.dispose();
 		terminalTitle.setTerminalWriter(null);
