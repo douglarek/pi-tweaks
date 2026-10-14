@@ -7,9 +7,6 @@ Configuration (CLI args take precedence over Environment variables):
 - Endpoint: --endpoint / --base-url / -e | ENDPOINT / BASE_URL / CPA_BASE_URL
 - API Key:  --api-key / --apikey / -k   | API_KEY / CPA_API_KEY (supports '!command' and '$ENV')
 - Model:    --model / -m                | MODEL / SEARCH_MODEL / CPA_MODEL / WEB_SEARCH_MODEL
-
-Notice: There is NO hardcoded default model. The user MUST explicitly configure
-the desired search model (e.g. '--model gemini-3.8-flash-high').
 """
 
 import sys
@@ -74,7 +71,7 @@ def resolve_server_config():
     )
     base_url = (cli_endpoint or env_endpoint or "").rstrip("/")
 
-    # 2. Model (No hardcoded default)
+    # 2. Model
     cli_model = get_cli_arg(["--model", "-m"])
     env_model = (
         os.environ.get("MODEL") or
