@@ -215,6 +215,32 @@ To use it, save the following JSON as `~/.pi/agent/themes/grok-transparent.json`
 
 </details>
 
+## Utilities
+
+### Native Search MCP (`bin/native-search-mcp`)
+
+A standalone, universal Model Context Protocol (MCP) server that provides real-time web search grounding via OpenAI/xAI/Google Responses API endpoints (`web_search_preview`). Works out of the box with any MCP-compatible agent or harness (such as Pi, Grok-build, Cursor, or Claude Desktop).
+
+Configure in `~/.pi/agent/mcp.json` or `~/.grok/config.toml`:
+
+```json
+{
+  "mcpServers": {
+    "native-search": {
+      "command": "/path/to/pi-tweaks/bin/native-search-mcp",
+      "args": [
+        "--endpoint", "https://api.example.com/v1",
+        "--api-key", "!security find-generic-password -s cpa-apikey -w",
+        "--model", "gemini-3.8-flash-high"
+      ],
+      "exposure": "direct"
+    }
+  }
+}
+```
+
+Supports `--endpoint`, `--api-key` (with `!command` shell execution or `$ENV` expansion), and `--model`.
+
 ## Current scope
 
 - Fullscreen mode; tested with Pi **1.0.4 – 1.2.0**.
