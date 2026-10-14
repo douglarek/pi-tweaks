@@ -1628,13 +1628,14 @@ test("pi-tweaks regression suite", async (t) => {
 		}
 	});
 
-	await t.test("web-search: isGeminiModel and syncWebSearchToolState scope tools to Gemini and GPT series", () => {
+	await t.test("web-search: isGeminiModel and syncWebSearchToolState scope tools to Gemini, GPT, and Grok series", () => {
 		assert.equal(isGeminiModel({ id: "gemini-3.8-flash-high" }), true);
 		assert.equal(isGeminiModel({ id: "gemini-2.5-pro" }), true);
 		assert.equal(isGeminiModel({ name: "Google: Gemini 3 Flash" }), true);
 		assert.equal(isGeminiModel({ id: "gpt-6-luna" }), true);
 		assert.equal(isGeminiModel({ id: "gpt-5.5" }), true);
-		assert.equal(isGeminiModel({ id: "grok-4.7" }), false);
+		assert.equal(isGeminiModel({ id: "grok-4.7" }), true);
+		assert.equal(isGeminiModel({ name: "Grok 4.7" }), true);
 		assert.equal(isGeminiModel({ id: "claude-3-7-sonnet" }), false);
 		assert.equal(isGeminiModel(null), false);
 
@@ -1644,8 +1645,8 @@ test("pi-tweaks regression suite", async (t) => {
 			setActiveTools: (tools) => { active = tools; },
 		};
 
-		// Non-gemini/non-gpt model (grok) does not activate web_search
-		syncWebSearchToolState(mockPi, { id: "grok-4.7" });
+		// Non-supported model (claude) does not activate web_search
+		syncWebSearchToolState(mockPi, { id: "claude-3-7-sonnet" });
 		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), false);
 
 		// Gemini model activates web_search
@@ -1656,8 +1657,12 @@ test("pi-tweaks regression suite", async (t) => {
 		syncWebSearchToolState(mockPi, { id: "gpt-6-luna" });
 		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), true);
 
-		// Switching back to non-supported model removes web_search
+		// Grok model keeps web_search active
 		syncWebSearchToolState(mockPi, { id: "grok-4.7" });
+		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), true);
+
+		// Switching back to non-supported model removes web_search
+		syncWebSearchToolState(mockPi, { id: "claude-3-7-sonnet" });
 		assert.equal(active.includes(WEB_SEARCH_TOOL_NAME), false);
 	});
 
@@ -1680,21 +1685,21 @@ test("pi-tweaks regression suite", async (t) => {
 		assert.ok(registeredTool.promptGuidelines.some((g) => g.includes("DuckDuckGo")), "mentions priority over duckduckgo");
 
 		// Execute with unsupported model fails gracefully
-		const unsupportedRes = await registeredTool.execute("call_1", { query: "test" }, undefined, undefined, { model: { id: "grok-4.7" } });
-		assert.ok(unsupportedRes.content[0].text.includes("exclusively available for Gemini and GPT models"));
+		const unsupportedRes = await registeredTool.execute("call_1", { query: "test" }, undefined, undefined, { model: { id: "claude-3-7-sonnet" } });
+		assert.ok(unsupportedRes.content[0].text.includes("exclusively available for Gemini, GPT, and Grok models"));
 
 		// session_start with Gemini model syncs tool
 		const sessionStartHandler = handlers.get("session_start");
 		sessionStartHandler({}, { model: { id: "gemini-3.8-flash-high" } });
 		assert.equal(active.includes("web_search"), true);
 
-		// session_start with GPT model syncs tool
-		sessionStartHandler({}, { model: { id: "gpt-6-luna" } });
+		// session_start with Grok model syncs tool
+		sessionStartHandler({}, { model: { id: "grok-4.7" } });
 		assert.equal(active.includes("web_search"), true);
 
 		// model_select with non-supported model removes tool
 		const modelSelectHandler = handlers.get("model_select");
-		modelSelectHandler({ model: { id: "grok-4.7" } }, {});
+		modelSelectHandler({ model: { id: "claude-3-7-sonnet" } }, {});
 		assert.equal(active.includes("web_search"), false);
 
 		// Test renderCall and renderResult folding

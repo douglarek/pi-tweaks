@@ -1,9 +1,9 @@
 /**
- * Native Web Search Tool for Gemini and GPT models.
+ * Native Web Search Tool for Gemini, GPT, and Grok models.
  *
- * Provides real-time Web Search Grounding via Antigravity / OpenAI backend (CPA / custom endpoint).
+ * Provides real-time Web Search Grounding via Antigravity / OpenAI / xAI backend (CPA / custom endpoint).
  * - Dynamically resolves baseUrl and apiKey purely through Pi's native modelRegistry interfaces.
- * - Scoped to Gemini and GPT series models.
+ * - Scoped to Gemini, GPT, and Grok series models.
  * - Prioritized above other search tools (such as DuckDuckGo).
  * - Compact tool rendering with automatic folding/collapsing of extra output.
  */
@@ -14,7 +14,7 @@ import { Text } from "@earendil-works/pi-tui";
 export const WEB_SEARCH_TOOL_NAME = "web_search";
 export const PREVIEW_LINES = 5;
 
-/** Check if the provided model is supported for native web_search (Gemini or GPT series) */
+/** Check if the provided model is supported for native web_search (Gemini, GPT, or Grok series) */
 export function isSupportedSearchModel(model?: { id?: string; name?: string; provider?: string } | null): boolean {
 	if (!model) return false;
 	const id = (model.id || "").toLowerCase();
@@ -25,6 +25,8 @@ export function isSupportedSearchModel(model?: { id?: string; name?: string; pro
 		name.includes("gemini") ||
 		id.includes("gpt") ||
 		name.includes("gpt") ||
+		id.includes("grok") ||
+		name.includes("grok") ||
 		provider.includes("gemini")
 	);
 }
@@ -150,24 +152,31 @@ export async function executeAntigravitySearch(
 	const data = (await response.json()) as {
 		output?: Array<{
 			type?: string;
-			action?: { queries?: string[]; sources?: Array<{ title?: string; url?: string }> };
+			action?: { type?: string; queries?: string[]; query?: string; url?: string; sources?: Array<{ title?: string; url?: string }> };
 			content?: Array<{ text?: string; annotations?: Array<{ title?: string; url?: string }> }>;
 		}>;
 	};
 
-	const searchCall = data.output?.find((o) => o.type === "web_search_call");
+	// Collect search calls (supports single or multi-step searches from Gemini, GPT, and Grok)
+	const searchCalls = data.output?.filter((o) => o.type === "web_search_call") || [];
 	const message = data.output?.find((o) => o.type === "message");
 	const text = message?.content?.map((c) => c.text).filter(Boolean).join("\n") || "";
 
 	const sources: { title: string; url: string }[] = [];
 	const seenUrls = new Set<string>();
 
-	if (searchCall?.action?.sources && Array.isArray(searchCall.action.sources)) {
-		for (const s of searchCall.action.sources) {
-			if (s?.url && !seenUrls.has(s.url)) {
-				seenUrls.add(s.url);
-				sources.push({ title: s.title || s.url, url: s.url });
+	for (const call of searchCalls) {
+		if (call?.action?.sources && Array.isArray(call.action.sources)) {
+			for (const s of call.action.sources) {
+				if (s?.url && !seenUrls.has(s.url)) {
+					seenUrls.add(s.url);
+					sources.push({ title: s.title || s.url, url: s.url });
+				}
 			}
+		}
+		if (call?.action?.url && !seenUrls.has(call.action.url)) {
+			seenUrls.add(call.action.url);
+			sources.push({ title: call.action.url, url: call.action.url });
 		}
 	}
 
@@ -187,7 +196,7 @@ export async function executeAntigravitySearch(
 	return { text, sources };
 }
 
-/** Synchronize web_search tool activation based on whether current model is supported (Gemini/GPT) */
+/** Synchronize web_search tool activation based on whether current model is supported */
 export function syncWebSearchToolState(
 	pi: ExtensionAPI,
 	model?: { id?: string; name?: string; provider?: string } | null,
@@ -218,10 +227,10 @@ export function installWebSearch(pi: ExtensionAPI): void {
 		name: WEB_SEARCH_TOOL_NAME,
 		label: "Web Search",
 		description:
-			"Primary and authoritative Web Search engine powered by Google / OpenAI Search Grounding. Provides real-time search results, live web information, current events, documentation, and citations. HIGHEST PRIORITY: Whenever web search is needed on Gemini and GPT models, ALWAYS prefer this tool before DuckDuckGo or any other search tool.",
-		promptSnippet: "Search the web using native search grounding (highest priority for Gemini and GPT models)",
+			"Primary and authoritative Web Search engine powered by Google / OpenAI / xAI Search Grounding. Provides real-time search results, live web information, current events, documentation, and citations. HIGHEST PRIORITY: Whenever web search is needed on Gemini, GPT, or Grok models, ALWAYS prefer this tool before DuckDuckGo or any other search tool.",
+		promptSnippet: "Search the web using native search grounding (highest priority for Gemini, GPT, and Grok models)",
 		promptGuidelines: [
-			"PRIORITY SEARCH RULE: When using Gemini or GPT models, ALWAYS prioritize using 'web_search' as your first-choice web search tool.",
+			"PRIORITY SEARCH RULE: When using Gemini, GPT, or Grok models, ALWAYS prioritize using 'web_search' as your first-choice web search tool.",
 			"Prefer 'web_search' over DuckDuckGo ('mcp__ddg_search__search') for real-time web searches, news, current facts, or live verification.",
 			"Only fall back to DuckDuckGo if 'web_search' fails or is unavailable.",
 		],
@@ -243,7 +252,7 @@ export function installWebSearch(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: `web_search is exclusively available for Gemini and GPT models. Current model is '${currentModel?.id || "unknown"}'. Please use alternative search tools like DuckDuckGo.`,
+							text: `web_search is exclusively available for Gemini, GPT, and Grok models. Current model is '${currentModel?.id || "unknown"}'. Please use alternative search tools like DuckDuckGo.`,
 						},
 					],
 					details: { query: params.query, sourcesCount: 0, error: "model_not_supported" },
