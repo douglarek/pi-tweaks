@@ -60,7 +60,7 @@ const {
 } = await jiti.import(fileURLToPath(new URL("../lib/recap.ts", import.meta.url)));
 const { isGeminiModel, syncWebSearchToolState, WEB_SEARCH_TOOL_NAME, installWebSearch, resolveModelEndpoint } =
 	await jiti.import(fileURLToPath(new URL("../lib/web-search.ts", import.meta.url)));
-const { formatBaseTitle, formatToolTitle, createTerminalTitleController, emitTerminalNotification, buildNotification } =
+const { formatBaseTitle, formatToolTitle, createTerminalTitleController, emitTerminalNotification, buildNotification, TITLE_SPINNER_FRAMES } =
 	await jiti.import(fileURLToPath(new URL("../lib/terminal-title.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
@@ -1747,13 +1747,14 @@ test("pi-tweaks regression suite", async (t) => {
 		assert.equal(formatBaseTitle("/Users/admin/work/ai-works/default"), "π - default");
 		assert.equal(formatBaseTitle("/Users/admin/work/ai-works/default", "feat-ui"), "π - feat-ui - default");
 
-		assert.ok(formatToolTitle("bash", { command: "cargo test --workspace" }, "/Users/admin/repo").includes("⚙ bash: cargo test --workspace · repo"));
-		assert.ok(formatToolTitle("read", { path: "src/main.rs" }, "/Users/admin/repo").includes("≡ read: main.rs · repo"));
-		assert.ok(formatToolTitle("edit", { path: "Cargo.toml" }, "/Users/admin/repo").includes("✎ edit: Cargo.toml · repo"));
-		assert.ok(formatToolTitle("web_search", { query: "Ghostty terminal title" }, "/Users/admin/repo").includes("⌕ search: Ghostty terminal title · repo"));
+		assert.ok(formatToolTitle("bash", { command: "cargo test --workspace" }, "/Users/admin/repo").includes("⠋ bash: cargo test --workspace · repo"));
+		assert.ok(formatToolTitle("read", { path: "src/main.rs" }, "/Users/admin/repo").includes("⠋ read: main.rs · repo"));
+		assert.ok(formatToolTitle("edit", { path: "Cargo.toml" }, "/Users/admin/repo").includes("⠋ edit: Cargo.toml · repo"));
+		assert.ok(formatToolTitle("web_search", { query: "Ghostty terminal title" }, "/Users/admin/repo").includes("⠋ search: Ghostty terminal title · repo"));
+		assert.ok(formatToolTitle("bash", { command: "make" }, "/Users/admin/repo", "⠙").includes("⠙ bash: make · repo"));
 	});
 
-	await t.test("terminal-title: createTerminalTitleController tracks agent turn and tool states", () => {
+	await t.test("terminal-title: createTerminalTitleController tracks agent turn and tool states with snake animation", async () => {
 		const handlers = new Map();
 		const titles = [];
 		const mockUi = {
@@ -1776,19 +1777,34 @@ test("pi-tweaks regression suite", async (t) => {
 
 			// turn_start
 			handlers.get("turn_start")({}, ctx);
-			assert.equal(titles.at(-1), "✎ Thinking... · my-project");
+			assert.equal(titles.at(-1), "⠋ Thinking... · my-project");
 
 			// tool_execution_start
 			handlers.get("tool_execution_start")({ toolName: "read", args: { path: "src/lib.rs" } }, ctx);
-			assert.equal(titles.at(-1), "≡ read: lib.rs · my-project");
+			assert.equal(titles.at(-1), "⠋ read: lib.rs · my-project");
 
 			// tool_execution_end
 			handlers.get("tool_execution_end")({ toolName: "read" }, ctx);
-			assert.equal(titles.at(-1), "✎ Thinking... · my-project");
+			assert.equal(titles.at(-1), "⠋ Thinking... · my-project");
 
 			// onAgentSettled
 			controller.onAgentSettled(ctx);
 			assert.equal(titles.at(-1), "π - my-project");
+
+			// Active spinner animation advances frames over time
+			handlers.get("turn_start")({}, ctx);
+			assert.equal(titles.at(-1), "⠋ Thinking... · my-project");
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			assert.ok(titles.at(-1).includes("Thinking... · my-project"));
+			assert.notEqual(titles.at(-1), "⠋ Thinking... · my-project");
+			assert.ok(TITLE_SPINNER_FRAMES.slice(1).some((f) => titles.at(-1).startsWith(f)));
+
+			// Settle stops spinner animation
+			controller.onAgentSettled(ctx);
+			assert.equal(titles.at(-1), "π - my-project");
+			const settledCount = titles.length;
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			assert.equal(titles.length, settledCount);
 		} finally {
 			controller.dispose();
 		}

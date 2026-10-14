@@ -27,9 +27,9 @@ pi remove git:github.com/douglarek/pi-tweaks
 
 Synchronizes the terminal window and tab title in real time with agent execution progress (via standard OSC sequences, matching `grok-build`'s behavior in modern terminals like Ghostty, Kitty, and WezTerm):
 - **Idle / Settled**: `π - <session/topic> - <cwd>`
-- **Thinking**: `✎ Thinking... · <cwd>`
-- **Tool Execution**: `⚙ bash: <command> · <cwd>`, `≡ read: <path> · <cwd>`, `✎ edit: <path> · <cwd>`, `⌕ search: <query> · <cwd>`
-- **Responding**: `✍ Responding... · <cwd>`
+- **Thinking**: `⠋ Thinking... · <cwd>` (animated braille spinner cycling `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧`)
+- **Tool Execution**: `⠋ bash: <command> · <cwd>`, `⠋ read: <path> · <cwd>`, `⠋ edit: <path> · <cwd>`, `⠋ search: <query> · <cwd>`
+- **Responding**: `⠋ Responding... · <cwd>`
 - **Desktop Notifications**: Emits native notifications (OSC 777 / OSC 9) upon turn completion with session topic, explicit stop reason, and duration.
 
 ### Compact tool calls

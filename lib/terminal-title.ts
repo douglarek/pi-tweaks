@@ -2,15 +2,27 @@
  * Dynamic Terminal Title & Desktop Notification Controller.
  *
  * Keeps the terminal/tab title (OSC 0, 1, 2) synchronized with agent execution progress
+ * using an animated braille spinner (matching grok-build's perimeter rectangle cycle)
  * and emits informative native desktop notifications (OSC 777 / OSC 9) on task completion:
  * - Idle / Settled: "π - <session/topic> - <cwd>"
- * - Thinking: "✎ Thinking... · <cwd>"
- * - Tool Execution: "⚙ bash: npm test · <cwd>", "≡ read: index.ts · <cwd>", "⌕ search: ... · <cwd>", etc.
- * - Responding: "✍ Responding... · <cwd>"
+ * - Thinking: "⠋ Thinking... · <cwd>" (animated through ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧)
+ * - Tool Execution: "⠋ bash: npm test · <cwd>", "⠋ read: index.ts · <cwd>", "⠋ search: ... · <cwd>", etc.
+ * - Responding: "⠋ Responding... · <cwd>"
  * - Task Settled: Emits native desktop notification with session topic, explicit stop reason, and duration
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
+
+/**
+ * 8-frame Braille spinner tracing the outer perimeter of a 2x3 rectangle clockwise:
+ * (1,2,4) -> (1,4,5) -> (1,4,5,6) -> (4,5,6) -> (3,4,5,6) -> (3,5,6) -> (2,3,6) -> (1,2,3,6)
+ * Identical to grok-build's TITLE_SPINNER.
+ */
+export const TITLE_SPINNER_FRAMES = [
+	"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧",
+];
+
+export const TITLE_SPINNER_INTERVAL_MS = 250;
 
 export interface TerminalTitleController {
 	dispose(): void;
@@ -19,7 +31,7 @@ export interface TerminalTitleController {
 	onAgentSettled(ctx?: ExtensionContext, aborted?: boolean): void;
 	setTerminalWriter(writer: ((seq: string) => void) | null): void;
 	formatBaseTitle(cwd: string, sessionTopic?: string): string;
-	formatToolTitle(toolName: string, args: Record<string, any> | undefined, cwd: string): string;
+	formatToolTitle(toolName: string, args: Record<string, any> | undefined, cwd: string, spinner?: string): string;
 	buildNotification(topic: string | undefined, dirName: string, metrics: TurnMetrics, aborted?: boolean): { title: string; body: string };
 }
 
@@ -77,7 +89,12 @@ export function formatBaseTitle(cwd: string, sessionTopic?: string): string {
 	return sessionTopic ? `π - ${sessionTopic} - ${dirName}` : `π - ${dirName}`;
 }
 
-export function formatToolTitle(rawToolName: string, args: Record<string, any> | undefined, cwd: string): string {
+export function formatToolTitle(
+	rawToolName: string,
+	args: Record<string, any> | undefined,
+	cwd: string,
+	spinner: string = TITLE_SPINNER_FRAMES[0],
+): string {
 	const dirName = path.basename(cwd || process.cwd()) || "workspace";
 	const toolName = (rawToolName || "").replace(/^mcp__.*?__/, "");
 	let action = toolName;
@@ -85,30 +102,28 @@ export function formatToolTitle(rawToolName: string, args: Record<string, any> |
 	if (toolName === "bash" || toolName === "powershell") {
 		const rawCmd = String(args?.command || "").trim().replace(/\s+/g, " ");
 		const cmd = rawCmd.length > 30 ? `${rawCmd.slice(0, 27)}...` : rawCmd;
-		action = cmd ? `⚙ ${toolName}: ${cmd}` : `⚙ ${toolName}`;
+		action = cmd ? `${toolName}: ${cmd}` : toolName;
 	} else if (toolName === "read") {
 		const target = path.basename(String(args?.path || ""));
-		action = target ? `≡ read: ${target}` : "≡ read";
+		action = target ? `read: ${target}` : "read";
 	} else if (toolName === "edit") {
 		const target = path.basename(String(args?.path || ""));
-		action = target ? `✎ edit: ${target}` : "✎ edit";
+		action = target ? `edit: ${target}` : "edit";
 	} else if (toolName === "write") {
 		const target = path.basename(String(args?.path || ""));
-		action = target ? `✎ write: ${target}` : "✎ write";
+		action = target ? `write: ${target}` : "write";
 	} else if (toolName === "grep") {
 		const pattern = String(args?.pattern || "").trim();
-		action = pattern ? `⌕ grep: ${pattern.slice(0, 20)}` : "⌕ grep";
+		action = pattern ? `grep: ${pattern.slice(0, 20)}` : "grep";
 	} else if (toolName === "find") {
 		const pattern = String(args?.pattern || "").trim();
-		action = pattern ? `⌕ find: ${pattern.slice(0, 20)}` : "⌕ find";
+		action = pattern ? `find: ${pattern.slice(0, 20)}` : "find";
 	} else if (toolName === "web_search" || toolName.includes("search")) {
 		const query = String(args?.query || "").trim();
-		action = query ? `⌕ search: ${query.slice(0, 25)}` : "⌕ search";
-	} else {
-		action = `⚡ ${toolName}`;
+		action = query ? `search: ${query.slice(0, 25)}` : "search";
 	}
 
-	return `${action} · ${dirName}`;
+	return `${spinner} ${action} · ${dirName}`;
 }
 
 /**
@@ -232,15 +247,21 @@ export function emitTerminalNotification(title: string, body: string, customWrit
 export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleController {
 	let isDisposed = false;
 	let currentState: "idle" | "thinking" | "responding" | "tool" = "idle";
+	let currentTool: { toolName: string; args?: Record<string, any> } | null = null;
 	let turnMetrics: TurnMetrics = { startTime: Date.now(), tools: [] };
 	let hadWorkInTurn = false;
 	let terminalWriter: ((seq: string) => void) | null = null;
 	let notifTimer: ReturnType<typeof setTimeout> | null = null;
+	let spinnerTimer: ReturnType<typeof setInterval> | null = null;
+	let spinnerFrameIndex = 0;
+	let activeContext: ExtensionContext | undefined;
+	let lastWrittenTitle = "";
 
 	function writeTitleEscape(title: string): void {
 		if (isDisposed) return;
 		const clean = title.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim();
-		if (!clean) return;
+		if (!clean || clean === lastWrittenTitle) return;
+		lastWrittenTitle = clean;
 
 		const isTmux = Boolean(process.env.TMUX);
 		// Emit OSC 0 (window+icon), OSC 1 (icon/tab), and OSC 2 (window) for universal terminal compatibility
@@ -268,8 +289,57 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 		writeTitleEscape(title);
 	}
 
+	function renderActiveTitle(): void {
+		if (isDisposed || currentState === "idle") return;
+		const frame = TITLE_SPINNER_FRAMES[spinnerFrameIndex % TITLE_SPINNER_FRAMES.length];
+		const dirName = path.basename(activeContext?.cwd || process.cwd()) || "workspace";
+
+		let title = "";
+		if (currentState === "thinking") {
+			title = `${frame} Thinking... · ${dirName}`;
+		} else if (currentState === "responding") {
+			title = `${frame} Responding... · ${dirName}`;
+		} else if (currentState === "tool" && currentTool) {
+			title = formatToolTitle(currentTool.toolName, currentTool.args, activeContext?.cwd || process.cwd(), frame);
+		} else {
+			title = `${frame} Thinking... · ${dirName}`;
+		}
+
+		setTitle(activeContext, title);
+	}
+
+	function startSpinner(ctx?: ExtensionContext): void {
+		if (ctx) activeContext = ctx;
+		if (isDisposed) return;
+		renderActiveTitle();
+		if (!spinnerTimer) {
+			spinnerTimer = setInterval(() => {
+				if (isDisposed || currentState === "idle") {
+					stopSpinner();
+					return;
+				}
+				spinnerFrameIndex = (spinnerFrameIndex + 1) % TITLE_SPINNER_FRAMES.length;
+				renderActiveTitle();
+			}, TITLE_SPINNER_INTERVAL_MS);
+			if (typeof (spinnerTimer as any)?.unref === "function") {
+				(spinnerTimer as any).unref();
+			}
+		}
+	}
+
+	function stopSpinner(): void {
+		if (spinnerTimer) {
+			clearInterval(spinnerTimer);
+			spinnerTimer = null;
+		}
+		spinnerFrameIndex = 0;
+	}
+
 	function resetTitle(ctx?: ExtensionContext): void {
+		stopSpinner();
 		currentState = "idle";
+		currentTool = null;
+		if (ctx) activeContext = ctx;
 		const cwd = ctx?.cwd || process.cwd();
 		const topic = extractSessionTopic(ctx);
 		setTitle(ctx, formatBaseTitle(cwd, topic));
@@ -279,9 +349,10 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 		isDisposed = false;
 		hadWorkInTurn = true;
 		currentState = "thinking";
+		currentTool = null;
 		turnMetrics = { startTime: Date.now(), tools: [] };
-		const dirName = path.basename(ctx.cwd || process.cwd()) || "workspace";
-		setTitle(ctx, `✎ Thinking... · ${dirName}`);
+		spinnerFrameIndex = 0;
+		startSpinner(ctx);
 	});
 
 	pi.on?.("before_agent_start", (event, _ctx) => {
@@ -295,16 +366,18 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 
 	pi.on?.("message_update", (event, ctx) => {
 		const eventType = (event as any)?.assistantMessageEvent?.type;
-		const dirName = path.basename(ctx.cwd || process.cwd()) || "workspace";
+		if (ctx) activeContext = ctx;
 
 		if (eventType === "thinking_start" && currentState !== "thinking") {
 			currentState = "thinking";
 			hadWorkInTurn = true;
-			setTitle(ctx, `✎ Thinking... · ${dirName}`);
+			currentTool = null;
+			startSpinner(ctx);
 		} else if (eventType === "text_start" && currentState !== "responding") {
 			currentState = "responding";
 			hadWorkInTurn = true;
-			setTitle(ctx, `✍ Responding... · ${dirName}`);
+			currentTool = null;
+			startSpinner(ctx);
 		}
 	});
 
@@ -312,17 +385,18 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 		isDisposed = false;
 		currentState = "tool";
 		hadWorkInTurn = true;
+		currentTool = { toolName: event.toolName, args: event.args };
 		turnMetrics.tools.push({ name: event.toolName, args: event.args });
-		setTitle(ctx, formatToolTitle(event.toolName, event.args, ctx.cwd));
+		startSpinner(ctx);
 	});
 
 	pi.on?.("tool_execution_end", (event, ctx) => {
 		currentState = "thinking";
+		currentTool = null;
 		if (event.isError) {
 			turnMetrics.lastError = typeof event.result === "string" ? event.result : `${event.toolName} failed`;
 		}
-		const dirName = path.basename(ctx.cwd || process.cwd()) || "workspace";
-		setTitle(ctx, `✎ Thinking... · ${dirName}`);
+		startSpinner(ctx);
 	});
 
 	pi.on?.("turn_end", (event, _ctx) => {
@@ -341,32 +415,44 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 
 	return {
 		dispose() {
+			stopSpinner();
 			if (notifTimer) {
 				clearTimeout(notifTimer);
 				notifTimer = null;
 			}
 			terminalWriter = null;
 			isDisposed = true;
+			currentState = "idle";
+			currentTool = null;
 		},
 		setTerminalWriter(writer) {
 			terminalWriter = writer;
 			isDisposed = false;
 		},
 		onSessionStart(ctx: ExtensionContext) {
+			stopSpinner();
 			isDisposed = false;
 			hadWorkInTurn = false;
+			currentState = "idle";
+			currentTool = null;
 			turnMetrics = { startTime: Date.now(), tools: [] };
 			resetTitle(ctx);
 		},
 		onSessionShutdown(ctx?: ExtensionContext) {
+			stopSpinner();
 			if (notifTimer) {
 				clearTimeout(notifTimer);
 				notifTimer = null;
 			}
 			hadWorkInTurn = false;
+			currentState = "idle";
+			currentTool = null;
 			resetTitle(ctx);
 		},
 		onAgentSettled(ctx?: ExtensionContext, aborted?: boolean) {
+			stopSpinner();
+			currentState = "idle";
+			currentTool = null;
 			const cwd = ctx?.cwd || process.cwd();
 			const dirName = path.basename(cwd) || "workspace";
 			const topic = extractSessionTopic(ctx);
@@ -382,6 +468,9 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 					const notif = buildNotification(topic, dirName, metricsSnapshot, Boolean(aborted));
 					emitTerminalNotification(notif.title, notif.body, terminalWriter);
 				}, 100);
+				if (typeof (notifTimer as any)?.unref === "function") {
+					(notifTimer as any).unref();
+				}
 			}
 
 			hadWorkInTurn = false;
