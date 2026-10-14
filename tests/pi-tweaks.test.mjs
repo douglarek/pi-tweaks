@@ -1765,6 +1765,8 @@ test("pi-tweaks regression suite", async (t) => {
 		};
 
 		const controller = createTerminalTitleController(mockPi);
+		const terminalOutputs = [];
+		controller.setTerminalWriter((seq) => terminalOutputs.push(seq));
 		try {
 			const ctx = { cwd: "/Users/admin/my-project", ui: mockUi };
 
@@ -1810,5 +1812,20 @@ test("pi-tweaks regression suite", async (t) => {
 
 		const abortNotif = buildNotification(topic, dir, { startTime, tools: [] }, true);
 		assert.ok(abortNotif.body.includes("已由用户取消"));
+	});
+
+	await t.test("terminal-title: emitTerminalNotification emits only once and formats Kitty OSC 99", () => {
+		const writes = [];
+		const writer = (seq) => writes.push(seq);
+
+		const seq = emitTerminalNotification("Fix Bug · repo", "[回答完毕 · 1.5s] done", writer);
+		assert.equal(writes.length, 1, "customWriter must be called exactly once");
+		assert.equal(writes[0], seq);
+
+		// When running under kitty (KITTY_PID), OSC 99 sets title (d=0) and body (d=1:p=body)
+		if (process.env.KITTY_PID || (process.env.TERM_PROGRAM || "").toLowerCase() === "kitty") {
+			assert.ok(seq.includes("99;i=pi:d=0;Fix Bug · repo"));
+			assert.ok(seq.includes("99;i=pi:d=1:p=body;[回答完毕 · 1.5s] done"));
+		}
 	});
 });

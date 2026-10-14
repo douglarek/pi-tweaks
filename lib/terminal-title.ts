@@ -207,7 +207,7 @@ export function emitTerminalNotification(title: string, body: string, customWrit
 	if (isGhostty) {
 		seq = `\x1b]777;notify;${cleanTitle || "Pi"};${cleanBody}\x1b\\`;
 	} else if (isKitty) {
-		seq = `\x1b]99;i=pi;${cleanBody} · ${cleanTitle}\x1b\\`;
+		seq = `\x1b]99;i=pi:d=0;${cleanTitle || "π"}\x1b\\\x1b]99;i=pi:d=1:p=body;${cleanBody}\x1b\\`;
 	} else {
 		seq = `\x1b]9;${cleanBody} · ${cleanTitle}\x07`;
 	}
@@ -220,10 +220,11 @@ export function emitTerminalNotification(title: string, body: string, customWrit
 		try {
 			customWriter(seq);
 		} catch {}
+	} else if (process.stdout?.isTTY) {
+		try {
+			process.stdout.write(seq);
+		} catch {}
 	}
-	try {
-		process.stdout.write(seq);
-	} catch {}
 
 	return seq;
 }
@@ -252,13 +253,11 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 			try {
 				terminalWriter(seq);
 			} catch {}
+		} else if (process.stdout?.isTTY) {
+			try {
+				process.stdout.write(seq);
+			} catch {}
 		}
-		try {
-			process.stdout.write(seq);
-		} catch {}
-		try {
-			process.stderr.write(seq);
-		} catch {}
 	}
 
 	function setTitle(ctx: ExtensionContext | undefined, title: string): void {

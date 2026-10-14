@@ -37,7 +37,6 @@ import {
 	type RecapEntryData,
 } from "./lib/recap.ts";
 import { createTerminalTitleController } from "./lib/terminal-title.ts";
-import { installTerminalTitle } from "./lib/terminal-title.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
