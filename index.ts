@@ -637,6 +637,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 	);
 	function remove(): void {
 		recap.dispose();
+		terminalTitle.setTerminalWriter(null);
 		terminalTitle.dispose();
 		detach?.();
 		detach = undefined;
@@ -656,6 +657,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 			if (widgetTheme) activeTheme = widgetTheme;
 			if (tui.mode === "fullscreen") {
 				try {
+					terminalTitle.setTerminalWriter((seq) => tui.terminal.write(seq));
 					detach = installPiTweaks(tui, () => {
 						try {
 							return ctx.ui.theme ?? activeTheme!;

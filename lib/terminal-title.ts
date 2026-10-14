@@ -1,13 +1,13 @@
 /**
  * Dynamic Terminal Title & Desktop Notification Controller.
  *
- * Keeps the terminal/tab title (OSC 0) synchronized with agent execution progress
- * and emits native desktop notifications (OSC 777 / OSC 9) on task completion:
- * - Idle / Settled: "π - <cwd>"
- * - Thinking: "🧠 Thinking... · <cwd>"
- * - Tool Execution: "⚙ bash: npm test · <cwd>", "📖 read: index.ts · <cwd>", etc.
+ * Keeps the terminal/tab title (OSC 0, 1, 2) synchronized with agent execution progress
+ * and emits informative native desktop notifications (OSC 777 / OSC 9) on task completion:
+ * - Idle / Settled: "π - <session/topic> - <cwd>"
+ * - Thinking: "✎ Thinking... · <cwd>"
+ * - Tool Execution: "⚙ bash: npm test · <cwd>", "≡ read: index.ts · <cwd>", "⌕ search: ... · <cwd>", etc.
  * - Responding: "✍ Responding... · <cwd>"
- * - Task Settled: Emits native desktop notification in Ghostty, Kitty, WezTerm, iTerm2, etc.
+ * - Task Settled: Emits native desktop notification with session topic, explicit stop reason, and duration
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
@@ -17,17 +17,69 @@ export interface TerminalTitleController {
 	onSessionStart(ctx: ExtensionContext): void;
 	onSessionShutdown(ctx?: ExtensionContext): void;
 	onAgentSettled(ctx?: ExtensionContext, aborted?: boolean): void;
-	formatBaseTitle(cwd: string, sessionName?: string): string;
+	setTerminalWriter(writer: ((seq: string) => void) | null): void;
+	formatBaseTitle(cwd: string, sessionTopic?: string): string;
 	formatToolTitle(toolName: string, args: Record<string, any> | undefined, cwd: string): string;
+	buildNotification(topic: string | undefined, dirName: string, metrics: TurnMetrics, aborted?: boolean): { title: string; body: string };
 }
 
-export function formatBaseTitle(cwd: string, sessionName?: string): string {
-	const dirName = path.basename(cwd || process.cwd()) || "workspace";
-	return sessionName ? `π - ${sessionName} - ${dirName}` : `π - ${dirName}`;
+export interface TurnMetrics {
+	startTime: number;
+	tools: Array<{ name: string; args?: any }>;
+	lastError?: string;
+	errorMessage?: string;
+	stopReason?: string;
+	currentPrompt?: string;
+	lastResponseText?: string;
 }
 
-export function formatToolTitle(toolName: string, args: Record<string, any> | undefined, cwd: string): string {
+export function formatDuration(ms: number): string {
+	if (ms < 1000) return `${ms}ms`;
+	return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * Derives a human-meaningful session topic:
+ * 1. Explicit session name if set by user or agent
+ * 2. The first user prompt in the branch/entries defining this session's goal
+ */
+export function extractSessionTopic(ctx?: ExtensionContext): string | undefined {
+	const sessionName = ctx?.sessionManager?.getSessionName?.();
+	if (sessionName && sessionName.trim()) {
+		return sessionName.trim();
+	}
+
+	const entries = ctx?.sessionManager?.getBranch?.() || ctx?.sessionManager?.getEntries?.() || [];
+	for (const entry of entries) {
+		const msg = (entry as any)?.message;
+		if (entry?.type === "message" && msg?.role === "user") {
+			let text = "";
+			if (typeof msg.content === "string") {
+				text = msg.content;
+			} else if (Array.isArray(msg.content)) {
+				text = msg.content
+					.filter((part: any) => part && part.type === "text" && typeof part.text === "string")
+					.map((part: any) => part.text)
+					.join(" ");
+			}
+			const cleaned = text.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim().replace(/\s+/g, " ");
+			if (cleaned) {
+				return cleaned.length > 25 ? `${cleaned.slice(0, 22)}...` : cleaned;
+			}
+		}
+	}
+
+	return undefined;
+}
+
+export function formatBaseTitle(cwd: string, sessionTopic?: string): string {
 	const dirName = path.basename(cwd || process.cwd()) || "workspace";
+	return sessionTopic ? `π - ${sessionTopic} - ${dirName}` : `π - ${dirName}`;
+}
+
+export function formatToolTitle(rawToolName: string, args: Record<string, any> | undefined, cwd: string): string {
+	const dirName = path.basename(cwd || process.cwd()) || "workspace";
+	const toolName = (rawToolName || "").replace(/^mcp__.*?__/, "");
 	let action = toolName;
 
 	if (toolName === "bash" || toolName === "powershell") {
@@ -36,22 +88,22 @@ export function formatToolTitle(toolName: string, args: Record<string, any> | un
 		action = cmd ? `⚙ ${toolName}: ${cmd}` : `⚙ ${toolName}`;
 	} else if (toolName === "read") {
 		const target = path.basename(String(args?.path || ""));
-		action = target ? `📖 read: ${target}` : "📖 read";
+		action = target ? `≡ read: ${target}` : "≡ read";
 	} else if (toolName === "edit") {
 		const target = path.basename(String(args?.path || ""));
-		action = target ? `✏ edit: ${target}` : "✏ edit";
+		action = target ? `✎ edit: ${target}` : "✎ edit";
 	} else if (toolName === "write") {
 		const target = path.basename(String(args?.path || ""));
-		action = target ? `📝 write: ${target}` : "📝 write";
+		action = target ? `✎ write: ${target}` : "✎ write";
 	} else if (toolName === "grep") {
 		const pattern = String(args?.pattern || "").trim();
-		action = pattern ? `🔎 grep: ${pattern.slice(0, 20)}` : "🔎 grep";
+		action = pattern ? `⌕ grep: ${pattern.slice(0, 20)}` : "⌕ grep";
 	} else if (toolName === "find") {
 		const pattern = String(args?.pattern || "").trim();
-		action = pattern ? `📁 find: ${pattern.slice(0, 20)}` : "📁 find";
+		action = pattern ? `⌕ find: ${pattern.slice(0, 20)}` : "⌕ find";
 	} else if (toolName === "web_search" || toolName.includes("search")) {
 		const query = String(args?.query || "").trim();
-		action = query ? `🔍 search: ${query.slice(0, 25)}` : "🔍 search";
+		action = query ? `⌕ search: ${query.slice(0, 25)}` : "⌕ search";
 	} else {
 		action = `⚡ ${toolName}`;
 	}
@@ -60,10 +112,88 @@ export function formatToolTitle(toolName: string, args: Record<string, any> | un
 }
 
 /**
+ * Builds an informative desktop notification title & body describing:
+ * - Session topic / workspace in title
+ * - Reason for stopping (Finished, Tool completed, Token limit, or Error) with exact elapsed time
+ * - Action or reply summary in body
+ */
+export function buildNotification(
+	topic: string | undefined,
+	dirName: string,
+	metrics: TurnMetrics,
+	aborted?: boolean,
+): { title: string; body: string } {
+	const notifTitle = topic ? `${topic} · ${dirName}` : `π · ${dirName}`;
+	const elapsed = Date.now() - (metrics.startTime || Date.now());
+	const duration = formatDuration(elapsed);
+	const stopReason = metrics.stopReason || "stop";
+
+	if (aborted) {
+		const promptInfo = metrics.currentPrompt ? ` "${metrics.currentPrompt}"` : "";
+		return {
+			title: notifTitle,
+			body: `[已由用户取消 · ${duration}]${promptInfo}`.trim(),
+		};
+	}
+
+	if (metrics.lastError || metrics.errorMessage || stopReason === "error") {
+		const err = metrics.lastError || metrics.errorMessage || "未知异常";
+		return {
+			title: notifTitle,
+			body: `[执行异常中断 · ${duration}] 错误: ${err}`,
+		};
+	}
+
+	let statusHeader = "";
+	let detailText = "";
+
+	if (stopReason === "max_tokens" || stopReason === "length") {
+		statusHeader = `[达到 Token 长度限制停止 · ${duration}]`;
+	} else if (metrics.tools && metrics.tools.length > 0) {
+		const toolCount = metrics.tools.length;
+		const toolNames = [...new Set(metrics.tools.map((t) => t.name.replace(/^mcp__.*?__/, "")))];
+
+		if (toolNames.some((t) => t.includes("search"))) {
+			statusHeader = `[搜索完成 · ${duration}]`;
+			const searchTool = metrics.tools.find((t) => t.name.includes("search"));
+			const q = searchTool?.args?.query;
+			detailText = q ? `检索 "${q.length > 25 ? `${q.slice(0, 22)}...` : q}"` : "网页检索完成";
+		} else if (toolNames.includes("edit") || toolNames.includes("write")) {
+			statusHeader = `[文件修改完成 · ${duration}]`;
+			const edits = metrics.tools.filter((t) => t.name === "edit" || t.name === "write");
+			const files = [...new Set(edits.map((e) => (e.args?.path ? path.basename(e.args.path) : "")))].filter(Boolean);
+			detailText = files.length > 0 ? `更新了 ${files.slice(0, 3).join(", ")}` : "代码编辑完成";
+		} else if (toolNames.includes("bash") || toolNames.includes("powershell")) {
+			statusHeader = `[命令执行完成 · ${duration}]`;
+			const bashTool = metrics.tools.find((t) => t.name === "bash" || t.name === "powershell");
+			const cmd = String(bashTool?.args?.command || "").trim().replace(/\s+/g, " ");
+			detailText = cmd ? `执行 ${cmd.length > 30 ? `${cmd.slice(0, 27)}...` : cmd}` : "终端命令完成";
+		} else {
+			statusHeader = `[工具执行完成 · ${duration}]`;
+			detailText = `调用了 ${toolCount} 项工具 (${toolNames.slice(0, 3).join(", ")})`;
+		}
+	} else {
+		statusHeader = `[回答完毕 · ${duration}]`;
+	}
+
+	if (!detailText && metrics.lastResponseText) {
+		detailText = metrics.lastResponseText.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim().replace(/\s+/g, " ");
+		if (detailText.length > 60) {
+			detailText = `${detailText.slice(0, 57)}...`;
+		}
+	} else if (!detailText && metrics.currentPrompt) {
+		detailText = `关于: "${metrics.currentPrompt}"`;
+	}
+
+	const body = detailText ? `${statusHeader} ${detailText}` : statusHeader;
+	return { title: notifTitle, body };
+}
+
+/**
  * Emits native desktop terminal notification escape sequences (OSC 777 / OSC 9 / OSC 99).
  * Seamlessly supported by modern terminals including Ghostty, Kitty, WezTerm, iTerm2, and Warp.
  */
-export function emitTerminalNotification(title: string, body: string): string {
+export function emitTerminalNotification(title: string, body: string, customWriter?: ((seq: string) => void) | null): string {
 	const cleanTitle = title.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim();
 	const cleanBody = body.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim();
 	if (!cleanBody) return "";
@@ -86,10 +216,13 @@ export function emitTerminalNotification(title: string, body: string): string {
 		seq = `\x1bPtmux;\x1b${seq.replace(/\x1b/g, "\x1b\x1b")}\x1b\\`;
 	}
 
+	if (typeof customWriter === "function") {
+		try {
+			customWriter(seq);
+		} catch {}
+	}
 	try {
-		if (process.stdout?.isTTY) {
-			process.stdout.write(seq);
-		}
+		process.stdout.write(seq);
 	} catch {}
 
 	return seq;
@@ -98,32 +231,67 @@ export function emitTerminalNotification(title: string, body: string): string {
 export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleController {
 	let isDisposed = false;
 	let currentState: "idle" | "thinking" | "responding" | "tool" = "idle";
+	let turnMetrics: TurnMetrics = { startTime: Date.now(), tools: [] };
 	let hadWorkInTurn = false;
+	let terminalWriter: ((seq: string) => void) | null = null;
+	let notifTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function writeTitleEscape(title: string): void {
+		if (isDisposed) return;
+		const clean = title.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim();
+		if (!clean) return;
+
+		const isTmux = Boolean(process.env.TMUX);
+		// Emit OSC 0 (window+icon), OSC 1 (icon/tab), and OSC 2 (window) for universal terminal compatibility
+		let seq = `\x1b]0;${clean}\x07\x1b]1;${clean}\x07\x1b]2;${clean}\x07`;
+		if (isTmux) {
+			seq = `\x1bPtmux;\x1b${seq.replace(/\x1b/g, "\x1b\x1b")}\x1b\\`;
+		}
+
+		if (typeof terminalWriter === "function") {
+			try {
+				terminalWriter(seq);
+			} catch {}
+		}
+		try {
+			process.stdout.write(seq);
+		} catch {}
+		try {
+			process.stderr.write(seq);
+		} catch {}
+	}
 
 	function setTitle(ctx: ExtensionContext | undefined, title: string): void {
 		if (isDisposed) return;
 		try {
 			ctx?.ui?.setTitle?.(title);
 		} catch {}
-		try {
-			if (process.stdout?.isTTY) {
-				process.stdout.write(`\x1b]0;${title}\x07`);
-			}
-		} catch {}
+		writeTitleEscape(title);
 	}
 
 	function resetTitle(ctx?: ExtensionContext): void {
 		currentState = "idle";
 		const cwd = ctx?.cwd || process.cwd();
-		const sessionName = pi.getSessionName?.();
-		setTitle(ctx, formatBaseTitle(cwd, sessionName));
+		const topic = extractSessionTopic(ctx);
+		setTitle(ctx, formatBaseTitle(cwd, topic));
 	}
 
 	pi.on?.("turn_start", (_event, ctx) => {
+		isDisposed = false;
 		hadWorkInTurn = true;
 		currentState = "thinking";
+		turnMetrics = { startTime: Date.now(), tools: [] };
 		const dirName = path.basename(ctx.cwd || process.cwd()) || "workspace";
-		setTitle(ctx, `🧠 Thinking... · ${dirName}`);
+		setTitle(ctx, `✎ Thinking... · ${dirName}`);
+	});
+
+	pi.on?.("before_agent_start", (event, _ctx) => {
+		if ((event as any)?.prompt) {
+			const raw = String((event as any).prompt).trim().replace(/\s+/g, " ");
+			if (raw) {
+				turnMetrics.currentPrompt = raw.length > 30 ? `${raw.slice(0, 27)}...` : raw;
+			}
+		}
 	});
 
 	pi.on?.("message_update", (event, ctx) => {
@@ -133,7 +301,7 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 		if (eventType === "thinking_start" && currentState !== "thinking") {
 			currentState = "thinking";
 			hadWorkInTurn = true;
-			setTitle(ctx, `🧠 Thinking... · ${dirName}`);
+			setTitle(ctx, `✎ Thinking... · ${dirName}`);
 		} else if (eventType === "text_start" && currentState !== "responding") {
 			currentState = "responding";
 			hadWorkInTurn = true;
@@ -142,38 +310,86 @@ export function createTerminalTitleController(pi: ExtensionAPI): TerminalTitleCo
 	});
 
 	pi.on?.("tool_execution_start", (event, ctx) => {
+		isDisposed = false;
 		currentState = "tool";
 		hadWorkInTurn = true;
+		turnMetrics.tools.push({ name: event.toolName, args: event.args });
 		setTitle(ctx, formatToolTitle(event.toolName, event.args, ctx.cwd));
 	});
 
-	pi.on?.("tool_execution_end", (_event, ctx) => {
+	pi.on?.("tool_execution_end", (event, ctx) => {
 		currentState = "thinking";
+		if (event.isError) {
+			turnMetrics.lastError = typeof event.result === "string" ? event.result : `${event.toolName} failed`;
+		}
 		const dirName = path.basename(ctx.cwd || process.cwd()) || "workspace";
-		setTitle(ctx, `🧠 Thinking... · ${dirName}`);
+		setTitle(ctx, `✎ Thinking... · ${dirName}`);
+	});
+
+	pi.on?.("turn_end", (event, _ctx) => {
+		if (event.message) {
+			turnMetrics.stopReason = event.message.stopReason;
+			turnMetrics.errorMessage = event.message.errorMessage;
+			const textParts = (event.message.content || [])
+				.filter((c: any) => c && c.type === "text" && typeof c.text === "string")
+				.map((c: any) => c.text)
+				.join(" ");
+			if (textParts) {
+				turnMetrics.lastResponseText = textParts;
+			}
+		}
 	});
 
 	return {
 		dispose() {
+			if (notifTimer) {
+				clearTimeout(notifTimer);
+				notifTimer = null;
+			}
+			terminalWriter = null;
 			isDisposed = true;
 		},
+		setTerminalWriter(writer) {
+			terminalWriter = writer;
+			isDisposed = false;
+		},
 		onSessionStart(ctx: ExtensionContext) {
+			isDisposed = false;
 			hadWorkInTurn = false;
+			turnMetrics = { startTime: Date.now(), tools: [] };
 			resetTitle(ctx);
 		},
 		onSessionShutdown(ctx?: ExtensionContext) {
+			if (notifTimer) {
+				clearTimeout(notifTimer);
+				notifTimer = null;
+			}
 			hadWorkInTurn = false;
 			resetTitle(ctx);
 		},
 		onAgentSettled(ctx?: ExtensionContext, aborted?: boolean) {
+			const cwd = ctx?.cwd || process.cwd();
+			const dirName = path.basename(cwd) || "workspace";
+			const topic = extractSessionTopic(ctx);
+			const metricsSnapshot = { ...turnMetrics, tools: [...turnMetrics.tools] };
+			const shouldNotify = !aborted && hadWorkInTurn;
+
 			resetTitle(ctx);
-			if (!aborted && hadWorkInTurn) {
-				const dirName = path.basename(ctx?.cwd || process.cwd()) || "workspace";
-				emitTerminalNotification(`π · ${dirName}`, "Task completed");
+
+			if (shouldNotify) {
+				if (notifTimer) clearTimeout(notifTimer);
+				notifTimer = setTimeout(() => {
+					notifTimer = null;
+					const notif = buildNotification(topic, dirName, metricsSnapshot, Boolean(aborted));
+					emitTerminalNotification(notif.title, notif.body, terminalWriter);
+				}, 100);
 			}
+
 			hadWorkInTurn = false;
+			turnMetrics = { startTime: Date.now(), tools: [] };
 		},
 		formatBaseTitle,
 		formatToolTitle,
+		buildNotification,
 	};
 }
