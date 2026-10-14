@@ -36,6 +36,8 @@ import {
 	RECAP_ENTRY_TYPE,
 	type RecapEntryData,
 } from "./lib/recap.ts";
+import { createTerminalTitleController } from "./lib/terminal-title.ts";
+import { installTerminalTitle } from "./lib/terminal-title.ts";
 
 /** Internal test injection points, not plugin settings or persisted configuration. */
 interface PiTweaksOptions {
@@ -623,6 +625,7 @@ export function installPiTweaks(tui: TUI, getTheme: () => Theme, options: PiTwea
 export default function piTweaks(pi: ExtensionAPI): void {
 	let detach: PiTweaksController | undefined;
 	let activeTheme: Theme | undefined;
+	const terminalTitle = createTerminalTitleController(pi);
 	const recap = createRecapController(
 		pi,
 		() => detach?.hasOverlay?.() ?? false,
@@ -634,6 +637,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 	);
 	function remove(): void {
 		recap.dispose();
+		terminalTitle.dispose();
 		detach?.();
 		detach = undefined;
 	}
@@ -645,6 +649,7 @@ export default function piTweaks(pi: ExtensionAPI): void {
 	});
 	pi.on("session_start", (_event, ctx) => {
 		remove();
+		terminalTitle.onSessionStart(ctx);
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		activeTheme = ctx.ui.theme;
 		ctx.ui.setWidget(WIDGET_KEY, (tui, widgetTheme) => {
@@ -671,9 +676,13 @@ export default function piTweaks(pi: ExtensionAPI): void {
 			return { render: () => [], invalidate() {}, dispose: remove };
 		});
 	});
-	pi.on("session_shutdown", remove);
+	pi.on("session_shutdown", (_event, ctx) => {
+		terminalTitle.onSessionShutdown(ctx);
+		remove();
+	});
 
 	pi.on("agent_settled", async (event, ctx) => {
+		terminalTitle.onAgentSettled(ctx, event.aborted);
 		recap.onTurnSettled(ctx);
 		if (event.aborted) {
 			detach?.clearSuggestion?.();

@@ -23,6 +23,14 @@ pi remove git:github.com/douglarek/pi-tweaks
 
 ## What we tweak
 
+### Dynamic terminal status title
+
+Synchronizes the terminal window and tab title in real time with agent execution progress (via standard OSC 0 sequences, matching `grok-build`'s behavior in modern terminals like Ghostty, Kitty, and WezTerm):
+- **Idle / Settled**: `π - <cwd>`
+- **Thinking**: `🧠 Thinking... · <cwd>`
+- **Tool Execution**: `⚙ bash: <command> · <cwd>`, `📖 read: <path> · <cwd>`, `✏ edit: <path> · <cwd>`, `🔍 search: <query> · <cwd>`
+- **Responding**: `✍ Responding... · <cwd>`
+
 ### Compact tool calls
 
 Native tool shells drop their extra top/bottom padding while keeping a single blank row between calls. Tool output content and tool-owned self renderers are left intact; expanding results, selecting text, and clicking tools keep their native behavior.

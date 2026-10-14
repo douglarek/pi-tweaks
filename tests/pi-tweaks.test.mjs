@@ -60,6 +60,8 @@ const {
 } = await jiti.import(fileURLToPath(new URL("../lib/recap.ts", import.meta.url)));
 const { isGeminiModel, syncWebSearchToolState, WEB_SEARCH_TOOL_NAME, installWebSearch, resolveModelEndpoint } =
 	await jiti.import(fileURLToPath(new URL("../lib/web-search.ts", import.meta.url)));
+const { formatBaseTitle, formatToolTitle, createTerminalTitleController, emitTerminalNotification } =
+	await jiti.import(fileURLToPath(new URL("../lib/terminal-title.ts", import.meta.url)));
 const { AssistantMessageComponent, UserMessageComponent, SkillInvocationMessageComponent,
 	ToolExecutionComponent, BashExecutionComponent, CustomMessageComponent, BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent, initTheme } = await import(`${pkg}/dist/index.js`);
@@ -1739,5 +1741,60 @@ test("pi-tweaks regression suite", async (t) => {
 		assert.equal(resolved.apiKey, "resolved-pi-key");
 		assert.equal(resolved.baseUrl, "https://custom-gateway.io/v1");
 		assert.equal(resolved.headers["x-custom"], "header");
+	});
+
+	await t.test("terminal-title: formatBaseTitle and formatToolTitle format clean titles", () => {
+		assert.equal(formatBaseTitle("/Users/admin/work/ai-works/default"), "π - default");
+		assert.equal(formatBaseTitle("/Users/admin/work/ai-works/default", "feat-ui"), "π - feat-ui - default");
+
+		assert.ok(formatToolTitle("bash", { command: "cargo test --workspace" }, "/Users/admin/repo").includes("⚙ bash: cargo test --workspace · repo"));
+		assert.ok(formatToolTitle("read", { path: "src/main.rs" }, "/Users/admin/repo").includes("📖 read: main.rs · repo"));
+		assert.ok(formatToolTitle("edit", { path: "Cargo.toml" }, "/Users/admin/repo").includes("✏ edit: Cargo.toml · repo"));
+		assert.ok(formatToolTitle("web_search", { query: "Ghostty terminal title" }, "/Users/admin/repo").includes("🔍 search: Ghostty terminal title · repo"));
+	});
+
+	await t.test("terminal-title: createTerminalTitleController tracks agent turn and tool states", () => {
+		const handlers = new Map();
+		const titles = [];
+		const mockUi = {
+			setTitle: (t) => titles.push(t),
+		};
+		const mockPi = {
+			on: (name, handler) => handlers.set(name, handler),
+			getSessionName: () => undefined,
+		};
+
+		const controller = createTerminalTitleController(mockPi);
+		try {
+			const ctx = { cwd: "/Users/admin/my-project", ui: mockUi };
+
+			// onSessionStart
+			controller.onSessionStart(ctx);
+			assert.equal(titles.at(-1), "π - my-project");
+
+			// turn_start
+			handlers.get("turn_start")({}, ctx);
+			assert.equal(titles.at(-1), "🧠 Thinking... · my-project");
+
+			// tool_execution_start
+			handlers.get("tool_execution_start")({ toolName: "read", args: { path: "src/lib.rs" } }, ctx);
+			assert.equal(titles.at(-1), "📖 read: lib.rs · my-project");
+
+			// tool_execution_end
+			handlers.get("tool_execution_end")({ toolName: "read" }, ctx);
+			assert.equal(titles.at(-1), "🧠 Thinking... · my-project");
+
+			// onAgentSettled
+			controller.onAgentSettled(ctx);
+			assert.equal(titles.at(-1), "π - my-project");
+		} finally {
+			controller.dispose();
+		}
+	});
+
+	await t.test("terminal-title: emitTerminalNotification builds valid OSC escape sequences", () => {
+		const ghosttySeq = emitTerminalNotification("Pi", "Task completed");
+		assert.ok(ghosttySeq.includes("Task completed"));
+		assert.ok(ghosttySeq.startsWith("\x1b]"));
 	});
 });
