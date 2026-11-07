@@ -12,12 +12,17 @@ Configuration (CLI args take precedence over Environment variables):
 import sys
 import json
 import os
+import re
+import gzip
+import zlib
 import subprocess
 import urllib.request
 import urllib.error
+from html.parser import HTMLParser
+from urllib.parse import urlparse
 
 SERVER_NAME = "native-search-mcp"
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
 
 def log(msg):
     """Write debug logs to stderr so stdin/stdout remain clean for JSON-RPC."""
@@ -124,7 +129,7 @@ def do_search(query: str, model_override: str = None) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         err_msg = e.read().decode("utf-8", errors="ignore")
@@ -173,6 +178,280 @@ def do_search(query: str, model_override: str = None) -> str:
 
     return formatted
 
+DEFAULT_FETCH_MAX_CHARS = 20000
+MAX_FETCH_BYTES = 2_000_000
+DEFAULT_FETCH_TIMEOUT = 30
+MAX_FETCH_TIMEOUT = 120
+FETCH_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
+class ReadableTextParser(HTMLParser):
+    """Collect readable text from HTML, dropping script/style/embed content."""
+
+    BLOCK_TAGS = {
+        "address", "article", "aside", "blockquote", "br", "dd", "div", "dl",
+        "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
+        "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p",
+        "pre", "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr",
+        "ul",
+    }
+    SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "canvas", "iframe"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.title_parts = []
+        self.skip_depth = 0
+        self.in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS:
+            self.skip_depth += 1
+            return
+        if self.skip_depth:
+            return
+        if tag == "title":
+            self.in_title = True
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag.lower() in self.BLOCK_TAGS and not self.skip_depth:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS:
+            if self.skip_depth:
+                self.skip_depth -= 1
+            return
+        if self.skip_depth:
+            return
+        if tag == "title":
+            self.in_title = False
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+        if self.in_title:
+            self.title_parts.append(data)
+        else:
+            self.parts.append(data)
+
+    def get_title(self):
+        return re.sub(r"\s+", " ", "".join(self.title_parts)).strip()
+
+    def get_text(self):
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t\f\v]+", " ", text)
+        text = re.sub(r"\s*\n\s*", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def _clamp_int(value, default, minimum, maximum):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def _validate_http_url(url):
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return parsed.geturl()
+
+
+def do_fetch_url(url, max_chars=DEFAULT_FETCH_MAX_CHARS, timeout_seconds=DEFAULT_FETCH_TIMEOUT):
+    """Fetch a URL over HTTP(S) and return readable text; JS-heavy pages may be empty."""
+    target = _validate_http_url(url)
+    if target is None:
+        return "Error: url must be an absolute http(s) URL"
+    max_chars = _clamp_int(max_chars, DEFAULT_FETCH_MAX_CHARS, 1000, 100000)
+    timeout_seconds = _clamp_int(timeout_seconds, DEFAULT_FETCH_TIMEOUT, 5, MAX_FETCH_TIMEOUT)
+
+    log(f"Executing fetch: url='{target}' timeout={timeout_seconds}s")
+    request = urllib.request.Request(
+        target,
+        headers={
+            "User-Agent": FETCH_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+            "Accept-Encoding": "identity",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            final_url = response.geturl()
+            status = response.status
+            headers = response.headers
+            raw = response.read(MAX_FETCH_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        body = error.read(MAX_FETCH_BYTES).decode("utf-8", errors="replace")
+        snippet = re.sub(r"\s+", " ", body)[:300]
+        return f"Error: HTTP {error.code} for {url}\n{snippet}"
+    except Exception as error:
+        return f"Error: fetch failed for {url}: {error}"
+
+    truncated_bytes = len(raw) > MAX_FETCH_BYTES
+    raw = raw[:MAX_FETCH_BYTES]
+    encoding = (headers.get("Content-Encoding") or "").lower()
+    try:
+        if encoding == "gzip":
+            raw = gzip.decompress(raw)
+        elif encoding == "deflate":
+            raw = zlib.decompress(raw)
+    except Exception as error:
+        return f"Error: could not decode {encoding} response: {error}"
+
+    charset = headers.get_content_charset() or "utf-8"
+    try:
+        body = raw.decode(charset, errors="replace")
+    except LookupError:
+        body = raw.decode("utf-8", errors="replace")
+
+    content_type = headers.get_content_type()
+    title = ""
+    if content_type in ("text/html", "application/xhtml+xml"):
+        parser = ReadableTextParser()
+        try:
+            parser.feed(body)
+            parser.close()
+        except Exception:
+            pass
+        title = parser.get_title()
+        text = parser.get_text()
+    elif content_type.startswith("text/") or content_type in (
+        "application/json",
+        "application/xml",
+        "application/javascript",
+    ):
+        text = body.strip()
+    else:
+        return (
+            f"Error: unsupported content type '{content_type}' for {url}; "
+            "web_fetch only extracts text from HTML/JSON/XML/text responses."
+        )
+
+    if not text:
+        text = (
+            "(No readable text extracted. The page may require JavaScript, "
+            "authentication, or bot verification; try web_read for JS-heavy pages.)"
+        )
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n(Content truncated. Fetch a more specific URL for the full text.)"
+
+    lines = [
+        f"Fetched: {final_url}",
+        f"Status: {status}",
+        f"Content-Type: {headers.get('Content-Type', content_type)}",
+    ]
+    if title:
+        lines.append(f"Title: {title}")
+    if truncated_bytes:
+        lines.append("Note: response body was truncated at 2 MB.")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(text)
+    return "\n".join(lines)
+
+
+def do_read_url(url, model_override=None, max_chars=DEFAULT_FETCH_MAX_CHARS):
+    """Read a URL through web-search grounding; useful for JS-heavy social pages."""
+    target = _validate_http_url(url)
+    if target is None:
+        return "Error: url must be an absolute http(s) URL"
+    max_chars = _clamp_int(max_chars, DEFAULT_FETCH_MAX_CHARS, 1000, 100000)
+
+    base_url, configured_model, api_key = resolve_server_config()
+    if not base_url:
+        return "Error: Missing endpoint configuration. Please pass '--endpoint <url>' or set BASE_URL."
+    if not api_key:
+        return "Error: Missing API key. Please pass '--api-key <key_or_!command>' or set API_KEY."
+    target_model = (model_override or configured_model or "").strip()
+    if not target_model:
+        return "Error: Missing model configuration. Please explicitly pass '--model <model_name>' or set MODEL."
+
+    prompt = (
+        "Read the web page at the URL below and return its main text content. "
+        "For a social post, return the post text verbatim and include any quoted post or thread. "
+        "Do not merely search for the URL or its numeric ID; use the page content. "
+        "Keep the original language. If the page cannot be accessed, say so explicitly.\n\n"
+        f"URL: {target}"
+    )
+    log(f"Executing read: url='{target}' model='{target_model}' endpoint='{base_url}'")
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps({
+            "model": target_model,
+            "input": prompt,
+            "tools": [{"type": "web_search_preview"}],
+        }).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return f"Web read HTTP error {error.code}: {error.read().decode('utf-8', errors='ignore')}"
+    except Exception as error:
+        return f"Web read network error: {error}"
+
+    outputs = data.get("output", [])
+    messages = [item for item in outputs if item.get("type") == "message"]
+    search_calls = [item for item in outputs if item.get("type") == "web_search_call"]
+
+    text_parts = []
+    for message in messages:
+        for content in message.get("content", []):
+            if content.get("text"):
+                text_parts.append(content["text"])
+    text = "\n".join(text_parts).strip() or "No page text returned."
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n(Content truncated.)"
+
+    sources = []
+    seen_urls = set()
+    for call in search_calls:
+        action = call.get("action", {})
+        for source in action.get("sources", []):
+            source_url = source.get("url")
+            if source_url and source_url not in seen_urls:
+                seen_urls.add(source_url)
+                sources.append({"title": source.get("title") or source_url, "url": source_url})
+        page_url = action.get("url")
+        if page_url and page_url not in seen_urls:
+            seen_urls.add(page_url)
+            sources.append({"title": page_url, "url": page_url})
+    for message in messages:
+        for content in message.get("content", []):
+            for annotation in content.get("annotations", []):
+                source_url = annotation.get("url")
+                if source_url and source_url not in seen_urls:
+                    seen_urls.add(source_url)
+                    sources.append({"title": annotation.get("title") or source_url, "url": source_url})
+
+    formatted = f"Read: {target}\n\n{text}"
+    if sources:
+        formatted += "\n\n### Web Sources:\n" + "\n".join(
+            f"- [{source['title']}]({source['url']})" for source in sources
+        )
+    return formatted
+
+
 def handle_rpc_request(req):
     method = req.get("method")
     msg_id = req.get("id")
@@ -200,6 +479,13 @@ def handle_rpc_request(req):
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
     elif method == "tools/list":
+        _, configured_model, _ = resolve_server_config()
+        model_hint = configured_model or "the server --model"
+        model_description = (
+            f"Model used for the request. Always set this to '{model_hint}' so the call shows which model runs. "
+            "Do not substitute another model unless the user explicitly names one. "
+            "If omitted, the server still uses its configured --model."
+        )
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -222,10 +508,63 @@ def handle_rpc_request(req):
                                 },
                                 "model": {
                                     "type": "string",
-                                    "description": "Optional model override for this search request (e.g. 'gemini-3.8-flash-high', 'grok-4.7', 'gpt-6-luna')"
+                                    "description": model_description
                                 }
                             },
                             "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "web_fetch",
+                        "description": (
+                            "Fetch an absolute http(s) URL over the network and return its readable text. "
+                            "HTML is converted to text; JSON/XML/plain text is returned as-is. "
+                            "Use this for normal pages. JavaScript-heavy or login-walled pages such as X/Twitter "
+                            "may return no useful text; use web_read for those."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "url": {
+                                    "type": "string",
+                                    "description": "Absolute http(s) URL to fetch"
+                                },
+                                "max_chars": {
+                                    "type": "integer",
+                                    "description": "Maximum characters to return (1000-100000, default 20000)"
+                                },
+                                "timeout_seconds": {
+                                    "type": "integer",
+                                    "description": "Request timeout in seconds (5-120, default 30)"
+                                }
+                            },
+                            "required": ["url"]
+                        }
+                    },
+                    {
+                        "name": "web_read",
+                        "description": (
+                            "Read a URL through the model's web-search grounding and return the page/post text. "
+                            "Use when web_fetch gets only a JavaScript shell or login page (for example X/Twitter). "
+                            "This is model-mediated, may summarize rather than quote, and costs one model request."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "url": {
+                                    "type": "string",
+                                    "description": "Absolute http(s) URL to read"
+                                },
+                                "max_chars": {
+                                    "type": "integer",
+                                    "description": "Maximum characters to return (1000-100000, default 20000)"
+                                },
+                                "model": {
+                                    "type": "string",
+                                    "description": model_description
+                                }
+                            },
+                            "required": ["url"]
                         }
                     }
                 ]
@@ -249,6 +588,50 @@ def handle_rpc_request(req):
                     }
                 }
             result_text = do_search(query, model_override)
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": result_text}]
+                }
+            }
+        elif tool_name == "web_fetch":
+            url = args.get("url", "")
+            if not url:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": "Error: Missing URL"}]
+                    }
+                }
+            result_text = do_fetch_url(
+                url,
+                args.get("max_chars", DEFAULT_FETCH_MAX_CHARS),
+                args.get("timeout_seconds", DEFAULT_FETCH_TIMEOUT),
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": result_text}]
+                }
+            }
+        elif tool_name == "web_read":
+            url = args.get("url", "")
+            if not url:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": "Error: Missing URL"}]
+                    }
+                }
+            result_text = do_read_url(
+                url,
+                args.get("model"),
+                args.get("max_chars", DEFAULT_FETCH_MAX_CHARS),
+            )
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
