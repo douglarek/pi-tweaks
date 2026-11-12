@@ -98,6 +98,16 @@ def resolve_server_config():
 
     return base_url, model, api_key
 
+def resolve_reasoning_effort():
+    """Resolve an optional reasoning effort; empty means omit the field entirely."""
+    cli_effort = get_cli_arg(["--reasoning-effort", "--effort"])
+    env_effort = (
+        os.environ.get("REASONING_EFFORT") or
+        os.environ.get("WEB_SEARCH_REASONING_EFFORT")
+    )
+    effort = (cli_effort or env_effort or "").strip().lower()
+    return "" if effort in ("", "none", "off", "default") else effort
+
 def do_search(query: str, model_override: str = None) -> str:
     """Execute search query using native search grounding backend."""
     base_url, configured_model, api_key = resolve_server_config()
@@ -110,7 +120,8 @@ def do_search(query: str, model_override: str = None) -> str:
     if not target_model:
         return "Error: Missing model configuration. Please explicitly pass '--model <model_name>' (e.g. '--model gemini-3.8-flash-high') or set the MODEL environment variable."
 
-    log(f"Executing search: query='{query}' model='{target_model}' endpoint='{base_url}'")
+    reasoning_effort = resolve_reasoning_effort()
+    log(f"Executing search: query='{query}' model='{target_model}' endpoint='{base_url}' effort='{reasoning_effort or 'default'}'")
     url = f"{base_url}/responses"
 
     payload = {
@@ -118,6 +129,8 @@ def do_search(query: str, model_override: str = None) -> str:
         "input": query,
         "tools": [{"type": "web_search_preview"}]
     }
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
 
     req = urllib.request.Request(
         url,
